@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+  session:
+    build:
+      context: ..
+      dockerfile: session/Dockerfile
+    ports:
+      - "8083:8083"
+      - "9092:9092"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+    depends_on:
+      - kafka
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1

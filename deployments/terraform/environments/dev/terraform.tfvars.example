@@ -1,0 +1,4 @@
+project_id        = "my-gcp-project"
+postgres_password = "change-me"
+jwt_secret        = "dev-secret-must-be-at-least-32-chars!!"
+image_tag         = "latest"

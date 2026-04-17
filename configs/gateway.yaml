@@ -1,0 +1,14 @@
+service:
+  name: gateway
+
+http:
+  port: 8080
+
+kafka:
+  acks: "leader"     # acks=1 for low-latency ingest (fire and forget)
+  producerlinger: 5ms
+  compression: snappy
+
+telemetry:
+  servicename: "pulse-gateway"
+  samplingrate: 0.001  # 0.1% for high-traffic gateway

@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: pulse
+  labels:
+    app: notification-service
+    component: engagement
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: notification-service
+  template:
+    metadata:
+      labels:
+        app: notification-service
+        component: engagement
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: notification-service
+          image: ${ECR_REGISTRY}/pulse-notificationservice:${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8084
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          env:
+            - name: CONFIG_PATH
+              value: /app/configs/base.yaml
+            - name: PULSE_SERVICE_ENVIRONMENT
+              value: production
+            - name: PULSE_KAFKA_BROKERS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-kafka-secret
+                  key: brokers
+            - name: PULSE_REDIS_ADDRS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-redis-secret
+                  key: addrs
+            - name: PULSE_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-postgres-secret
+                  key: dsn
+            - name: PULSE_AUTH_JWTSECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-auth-secret
+                  key: jwt-secret
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 2
+      volumes:
+        - name: configs
+          configMap:
+            name: pulse-configs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  namespace: pulse
+  labels:
+    app: notification-service
+spec:
+  selector:
+    app: notification-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP

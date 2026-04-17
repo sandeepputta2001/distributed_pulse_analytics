@@ -1,0 +1,46 @@
+openapi: "3.0.3"
+info:
+  title: Notification Service
+  description: Internal health and metrics endpoints for the PulseAnalytics Notification Service
+  version: "1.0.0"
+
+servers:
+  - url: http://localhost:8087
+    description: Local development
+
+paths:
+  /health:
+    get:
+      summary: Liveness check
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: notification
+
+  /ready:
+    get:
+      summary: Readiness check
+      responses:
+        "200":
+          description: Service is ready
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        "200":
+          description: Prometheus text format
+          content:
+            text/plain:
+              schema:
+                type: string

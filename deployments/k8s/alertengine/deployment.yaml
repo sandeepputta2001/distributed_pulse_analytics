@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertengine
+  namespace: pulse
+  labels:
+    app: alertengine
+    component: alerting
+spec:
+  replicas: 2   # active-passive: only one evaluates at a time via leader-election lock in Redis
+  selector:
+    matchLabels:
+      app: alertengine
+  template:
+    metadata:
+      labels:
+        app: alertengine
+        component: alerting
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: alertengine
+          image: ${ECR_REGISTRY}/pulse-alertengine:${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports:
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          env:
+            - name: CONFIG_PATH
+              value: /app/configs/base.yaml
+            - name: PULSE_SERVICE_ENVIRONMENT
+              value: production
+            - name: PULSE_CLICKHOUSE_HOSTS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-clickhouse-secret
+                  key: hosts
+            - name: PULSE_REDIS_ADDRS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-redis-secret
+                  key: addrs
+            - name: PULSE_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-postgres-secret
+                  key: dsn
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "kill -0 1"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: configs
+          configMap:
+            name: pulse-configs

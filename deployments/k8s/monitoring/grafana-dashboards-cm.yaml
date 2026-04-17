@@ -1,0 +1,218 @@
+# ─── Grafana Dashboards — ConfigMap ───────────────────────────────────────────
+# Label grafana_dashboard=1 triggers the Grafana sidecar to auto-import these.
+# Each key becomes a .json file in the dashboards folder.
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulse-grafana-dashboards
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  # ── Ingest Overview Dashboard ─────────────────────────────────────────────
+  pulse-ingest.json: |
+    {
+      "title": "Pulse — Ingest Gateway",
+      "uid": "pulse-ingest",
+      "tags": ["pulse", "ingest"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "30s",
+      "panels": [
+        {
+          "title": "Events Ingested / sec",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+          "targets": [{
+            "expr": "rate(pulse_ingest_events_total[1m])",
+            "legendFormat": "events/sec"
+          }]
+        },
+        {
+          "title": "Ingest Error Rate",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+          "targets": [{
+            "expr": "rate(pulse_ingest_errors_total[5m]) / rate(pulse_ingest_requests_total[5m])",
+            "legendFormat": "error rate"
+          }]
+        },
+        {
+          "title": "P95 Ingest Latency",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+          "targets": [{
+            "expr": "histogram_quantile(0.95, rate(pulse_ingest_latency_seconds_bucket[5m]))",
+            "legendFormat": "p95 latency"
+          }]
+        },
+        {
+          "title": "Duplicates Filtered",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+          "targets": [{
+            "expr": "rate(pulse_ingest_duplicates_filtered_total[5m])",
+            "legendFormat": "dedup/sec"
+          }]
+        },
+        {
+          "title": "Ingest Throughput Over Time",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 4},
+          "targets": [
+            {
+              "expr": "rate(pulse_ingest_events_total[1m])",
+              "legendFormat": "events/sec"
+            },
+            {
+              "expr": "rate(pulse_ingest_errors_total[1m])",
+              "legendFormat": "errors/sec"
+            }
+          ]
+        },
+        {
+          "title": "Kafka Produce Lag",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+          "targets": [{
+            "expr": "pulse_consumer_lag",
+            "legendFormat": "{{topic}} {{consumer_group}}"
+          }]
+        },
+        {
+          "title": "Batch Size Distribution",
+          "type": "histogram",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+          "targets": [{
+            "expr": "rate(pulse_ingest_batch_size_bucket[5m])",
+            "legendFormat": "batch size"
+          }]
+        }
+      ]
+    }
+
+  # ── Analytics Query API Dashboard ─────────────────────────────────────────
+  pulse-queryapi.json: |
+    {
+      "title": "Pulse — Query API",
+      "uid": "pulse-queryapi",
+      "tags": ["pulse", "query"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "60s",
+      "panels": [
+        {
+          "title": "Query Requests / sec",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+          "targets": [{"expr": "rate(pulse_query_requests_total[1m])", "legendFormat": "req/sec"}]
+        },
+        {
+          "title": "P95 Query Latency",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+          "targets": [{"expr": "histogram_quantile(0.95, rate(pulse_clickhouse_query_latency_seconds_bucket[5m]))", "legendFormat": "p95"}]
+        },
+        {
+          "title": "Cache Hit Rate",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+          "targets": [{
+            "expr": "rate(pulse_redis_cache_hits_total[5m]) / (rate(pulse_redis_cache_hits_total[5m]) + rate(pulse_redis_cache_misses_total[5m]))",
+            "legendFormat": "cache hit %"
+          }]
+        },
+        {
+          "title": "ClickHouse Insert Rate",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+          "targets": [{"expr": "rate(pulse_clickhouse_inserted_total[1m])", "legendFormat": "rows/sec"}]
+        },
+        {
+          "title": "Query Latency by Type",
+          "type": "timeseries",
+          "gridPos": {"h": 10, "w": 24, "x": 0, "y": 4},
+          "targets": [{
+            "expr": "histogram_quantile(0.95, rate(pulse_clickhouse_query_latency_seconds_bucket[5m])) by (query_type)",
+            "legendFormat": "{{query_type}} p95"
+          }]
+        }
+      ]
+    }
+
+  # ── Session & Funnel Dashboard ─────────────────────────────────────────────
+  pulse-sessions.json: |
+    {
+      "title": "Pulse — Sessions & Funnels",
+      "uid": "pulse-sessions",
+      "tags": ["pulse", "sessions"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "60s",
+      "panels": [
+        {
+          "title": "Sessions Opened / min",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+          "targets": [{"expr": "rate(pulse_sessions_opened_total[1m]) * 60", "legendFormat": "sessions/min"}]
+        },
+        {
+          "title": "Avg Session Duration",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+          "targets": [{"expr": "histogram_quantile(0.5, rate(pulse_session_duration_seconds_bucket[10m]))", "legendFormat": "median duration"}]
+        },
+        {
+          "title": "Session Duration Histogram",
+          "type": "timeseries",
+          "gridPos": {"h": 10, "w": 24, "x": 0, "y": 4},
+          "targets": [
+            {"expr": "histogram_quantile(0.50, rate(pulse_session_duration_seconds_bucket[5m]))", "legendFormat": "p50"},
+            {"expr": "histogram_quantile(0.95, rate(pulse_session_duration_seconds_bucket[5m]))", "legendFormat": "p95"},
+            {"expr": "histogram_quantile(0.99, rate(pulse_session_duration_seconds_bucket[5m]))", "legendFormat": "p99"}
+          ]
+        }
+      ]
+    }
+
+  # ── Infrastructure SLO Dashboard ──────────────────────────────────────────
+  pulse-slo.json: |
+    {
+      "title": "Pulse — SLO Tracking",
+      "uid": "pulse-slo",
+      "tags": ["pulse", "slo"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "5m",
+      "panels": [
+        {
+          "title": "Ingest Availability SLO (target: 99.9%)",
+          "type": "gauge",
+          "gridPos": {"h": 6, "w": 8, "x": 0, "y": 0},
+          "options": {"minValue": 99, "maxValue": 100, "thresholds": {"steps": [{"value": 99.5, "color": "red"}, {"value": 99.9, "color": "yellow"}, {"value": 100, "color": "green"}]}},
+          "targets": [{
+            "expr": "100 * (1 - rate(pulse_ingest_errors_total[24h]) / rate(pulse_ingest_requests_total[24h]))",
+            "legendFormat": "availability %"
+          }]
+        },
+        {
+          "title": "Query P95 SLO (target: <200ms)",
+          "type": "gauge",
+          "gridPos": {"h": 6, "w": 8, "x": 8, "y": 0},
+          "targets": [{
+            "expr": "100 * rate(pulse_clickhouse_query_latency_seconds_bucket{le='0.2'}[1h]) / rate(pulse_clickhouse_query_latency_seconds_count[1h])",
+            "legendFormat": "% queries < 200ms"
+          }]
+        },
+        {
+          "title": "Kafka Consumer Lag (all groups)",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 6},
+          "targets": [{
+            "expr": "pulse_consumer_lag",
+            "legendFormat": "{{topic}} / {{consumer_group}}"
+          }]
+        }
+      ]
+    }

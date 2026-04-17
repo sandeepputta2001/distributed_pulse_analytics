@@ -1,0 +1,32 @@
+openapi: "3.0.3"
+info:
+  title: Enricher
+  description: Internal health and metrics for the PulseAnalytics Enricher service
+  version: "1.0.0"
+
+servers:
+  - url: http://localhost:8082
+
+paths:
+  /health:
+    get:
+      summary: Liveness
+      responses:
+        "200":
+          description: OK
+  /ready:
+    get:
+      summary: Readiness
+      responses:
+        "200":
+          description: OK
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        "200":
+          description: Prometheus text format
+          content:
+            text/plain:
+              schema:
+                type: string

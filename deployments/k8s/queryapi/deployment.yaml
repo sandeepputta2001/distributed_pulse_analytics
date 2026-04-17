@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: query-api
+  namespace: pulse
+  labels:
+    app: query-api
+    component: serving
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: query-api
+  template:
+    metadata:
+      labels:
+        app: query-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: query-api
+          image: ${ECR_REGISTRY}/pulse-query-api:${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8082
+            - name: metrics
+              containerPort: 9091
+          env:
+            - name: CONFIG_PATH
+              value: /app/configs/queryapi.yaml
+            - name: PULSE_SERVICE_ENVIRONMENT
+              value: production
+            - name: PULSE_CLICKHOUSE_HOSTS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-clickhouse-secret
+                  key: hosts
+            - name: PULSE_REDIS_ADDRS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-redis-secret
+                  key: addrs
+            - name: PULSE_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-postgres-secret
+                  key: dsn
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+      volumes:
+        - name: configs
+          configMap:
+            name: pulse-configs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: query-api
+  namespace: pulse
+spec:
+  selector:
+    app: query-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: query-api-hpa
+  namespace: pulse
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: query-api
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

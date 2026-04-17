@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chwriter
+  namespace: pulse
+  labels:
+    app: chwriter
+    component: storage
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: chwriter
+  template:
+    metadata:
+      labels:
+        app: chwriter
+        component: storage
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 90   # allow final batch flush to ClickHouse
+      containers:
+        - name: chwriter
+          image: ${ECR_REGISTRY}/pulse-chwriter:${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports:
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          env:
+            - name: CONFIG_PATH
+              value: /app/configs/base.yaml
+            - name: PULSE_SERVICE_ENVIRONMENT
+              value: production
+            - name: PULSE_KAFKA_BROKERS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-kafka-secret
+                  key: brokers
+            - name: PULSE_CLICKHOUSE_HOSTS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-clickhouse-secret
+                  key: hosts
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"   # large buffer for batch accumulation
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "kill -0 1"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: configs
+          configMap:
+            name: pulse-configs
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: chwriter
+                topologyKey: kubernetes.io/hostname
+---
+# KEDA ScaledObject — scale on session-events Kafka consumer lag
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: chwriter-scaledobject
+  namespace: pulse
+spec:
+  scaleTargetRef:
+    name: chwriter
+  minReplicaCount: 3
+  maxReplicaCount: 50
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka-cluster:9092
+        consumerGroup: chwriter-group
+        topic: enriched-events
+        lagThreshold: "200000"  # highest-volume topic — scale up if lag exceeds 200K messages
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka-cluster:9092
+        consumerGroup: chwriter-group
+        topic: session-events
+        lagThreshold: "100000"  # scale up if lag exceeds 100K messages
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka-cluster:9092
+        consumerGroup: chwriter-group
+        topic: agg-results
+        lagThreshold: "50000"   # funnel conversion results — scale up if lag exceeds 50K messages

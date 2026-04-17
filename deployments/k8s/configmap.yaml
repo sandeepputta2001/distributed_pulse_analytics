@@ -1,0 +1,171 @@
+# ─── Pulse Analytics — ConfigMap ──────────────────────────────────────────────
+# Mounts the entire configs/ directory into every pod at /app/configs.
+# Each service reads its own YAML file via the CONFIG_PATH env var.
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulse-configs
+  namespace: pulse
+data:
+  # ── base.yaml ────────────────────────────────────────────────────────────────
+  base.yaml: |
+    service:
+      name: pulse
+      environment: production
+
+    http:
+      host: "0.0.0.0"
+      port: 8080
+      readTimeout: 10s
+      writeTimeout: 30s
+      idleTimeout: 120s
+      shutdownTimeout: 30s
+
+    kafka:
+      brokers: []         # injected from secret at runtime via PULSE_KAFKA_BROKERS
+      groupPrefix: "pulse"
+      maxPollRecords: 500
+      sessionTimeout: 30s
+      workerCount: 50
+
+    redis:
+      addrs: []           # injected from secret at runtime via PULSE_REDIS_ADDRS
+      password: ""
+      db: 0
+      poolSize: 20
+      minIdleConns: 5
+      dialTimeout: 3s
+      readTimeout: 1s
+      writeTimeout: 1s
+
+    clickhouse:
+      hosts: []           # injected via PULSE_CLICKHOUSE_HOSTS
+      database: pulse
+      username: pulse_user
+      password: ""
+      maxOpenConns: 20
+      maxIdleConns: 5
+      dialTimeout: 5s
+      queryTimeout: 30s
+
+    postgres:
+      dsn: ""             # injected via PULSE_POSTGRES_DSN
+      maxConns: 20
+      minConns: 5
+      maxConnLifetime: 1h
+      maxConnIdleTime: 30m
+
+    mongo:
+      uri: ""             # injected via PULSE_MONGO_URI
+      database: pulse
+      connectTimeout: 5s
+
+    auth:
+      jwtSecret: ""       # injected via PULSE_AUTH_JWTSECRET
+      jwtExpiry: 24h
+      apiKeyCacheTTL: 5m
+
+    telemetry:
+      enabled: true
+      endpoint: "otel-collector:4317"
+      samplingRatio: 0.1   # 10% tail-based sampling; 100% for errors
+      insecure: true        # use TLS in production with cert-manager
+
+    geoip:
+      dbPath: "/data/GeoLite2-City.mmdb"
+
+  # ── gateway.yaml ──────────────────────────────────────────────────────────────
+  gateway.yaml: |
+    service:
+      name: gateway
+
+    http:
+      port: 8080
+      readTimeout: 5s
+      writeTimeout: 10s
+
+    ingest:
+      maxBatchSize: 500
+      maxBodyBytes: 5242880   # 5 MB
+      gzipThreshold: 1024     # decompress if body > 1KB
+
+    ratelimit:
+      defaultRPS: 1000
+      defaultBurst: 5000
+
+    dedup:
+      bloomCapacity: 10000000
+      bloomFPRate: 0.001
+      exactTTL: 300s
+
+    kafka:
+      topic: raw-events
+
+  # ── enricher.yaml ────────────────────────────────────────────────────────────
+  enricher.yaml: |
+    service:
+      name: enricher
+
+    kafka:
+      inputTopic: raw-events
+      outputTopic: enriched-events
+      groupId: enricher-group
+      workerCount: 50
+
+    geoip:
+      dbPath: "/data/GeoLite2-City.mmdb"
+
+  # ── queryapi.yaml ────────────────────────────────────────────────────────────
+  queryapi.yaml: |
+    service:
+      name: query-api
+
+    http:
+      port: 8082
+      readTimeout: 10s
+      writeTimeout: 60s
+      shutdownTimeout: 30s
+
+    cache:
+      localTTL: 60s
+      redisTTL: 300s
+
+  # ── otel-collector.yaml ───────────────────────────────────────────────────────
+  otel-collector.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch:
+        timeout: 5s
+        send_batch_size: 512
+      memory_limiter:
+        limit_mib: 512
+        spike_limit_mib: 128
+        check_interval: 5s
+
+    exporters:
+      jaeger:
+        endpoint: "jaeger-collector:14250"
+        tls:
+          insecure: true
+      prometheus:
+        endpoint: "0.0.0.0:8889"
+        namespace: pulse_otel
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [jaeger]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [prometheus]

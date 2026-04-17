@@ -1,0 +1,200 @@
+# ─── Kafka Topic Setup Job ────────────────────────────────────────────────────
+# Creates all six PulseAnalytics topics on an external managed Kafka cluster
+# (Confluent Cloud or any Apache Kafka-compatible broker).
+#
+# Runs as a one-shot Kubernetes Job at deploy time. Idempotent — safe to re-run.
+# Uses the official bitnami/kafka image (includes kafka-topics.sh).
+#
+# Required secret: pulse-kafka-secret
+#   brokers:    bootstrap address(es), e.g. "pkc-xxx.us-central1.gcp.confluent.cloud:9092"
+#   api-key:    SASL_SSL username  (Confluent API key ID)
+#   api-secret: SASL_SSL password (Confluent API key secret)
+#
+# Usage:
+#   kubectl apply -f kafka-setup-job.yaml -n pulse
+#   kubectl wait --for=condition=complete job/kafka-topic-setup -n pulse --timeout=120s
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-topic-setup-script
+  namespace: pulse
+data:
+  setup-topics.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    BOOTSTRAP="${KAFKA_BOOTSTRAP_SERVERS}"
+    EXTRA_OPTS=""
+
+    # SASL_SSL config (used for Confluent Cloud; omit for plain plaintext dev clusters)
+    if [ -n "${KAFKA_API_KEY:-}" ]; then
+      JAAS="org.apache.kafka.common.security.plain.PlainLoginModule required username=\"${KAFKA_API_KEY}\" password=\"${KAFKA_API_SECRET}\";"
+      EXTRA_OPTS="--command-config /tmp/client.properties"
+      cat > /tmp/client.properties <<EOF
+    security.protocol=SASL_SSL
+    sasl.mechanism=PLAIN
+    sasl.jaas.config=${JAAS}
+    EOF
+    fi
+
+    create_topic() {
+      local TOPIC=$1
+      local PARTITIONS=$2
+      local RETENTION_MS=$3
+      local COMPRESSION=$4
+      local MIN_ISR=$5
+      local MAX_MSG_BYTES=${6:-5242880}
+
+      echo "→ Creating topic: ${TOPIC} (partitions=${PARTITIONS}, retention=${RETENTION_MS}ms)"
+
+      kafka-topics.sh \
+        --bootstrap-server "${BOOTSTRAP}" \
+        --create \
+        --if-not-exists \
+        --topic "${TOPIC}" \
+        --partitions "${PARTITIONS}" \
+        --replication-factor 3 \
+        ${EXTRA_OPTS} \
+        --config retention.ms="${RETENTION_MS}" \
+        --config compression.type="${COMPRESSION}" \
+        --config min.insync.replicas="${MIN_ISR}" \
+        --config cleanup.policy=delete \
+        --config segment.ms=3600000 \
+        --config max.message.bytes="${MAX_MSG_BYTES}" \
+        && echo "  ✓ ${TOPIC} ready" \
+        || echo "  ✓ ${TOPIC} already exists"
+    }
+
+    echo "=== PulseAnalytics Kafka Topic Setup ==="
+    echo "Bootstrap: ${BOOTSTRAP}"
+    echo ""
+
+    # Topic name           partitions  retention_ms  compression  min_isr  max_msg_bytes
+    create_topic "raw-events"       12  172800000  snappy  2  5242880
+    create_topic "enriched-events"  12  172800000  snappy  2  5242880
+    create_topic "session-events"    6   86400000  snappy  2  1048576
+    create_topic "agg-results"       4   86400000  snappy  2  1048576
+    create_topic "dlq-events"        2  604800000  gzip    1  10485760
+    create_topic "notifications"     2   86400000  snappy  1  1048576
+
+    echo ""
+    echo "=== Topic setup complete. Listing all topics: ==="
+    kafka-topics.sh \
+      --bootstrap-server "${BOOTSTRAP}" \
+      ${EXTRA_OPTS} \
+      --list \
+      | grep -E "^(raw-events|enriched-events|session-events|agg-results|dlq-events|notifications)$" \
+      | sort
+
+    echo ""
+    echo "=== Describing topic configs ==="
+    for TOPIC in raw-events enriched-events session-events agg-results dlq-events notifications; do
+      kafka-topics.sh \
+        --bootstrap-server "${BOOTSTRAP}" \
+        ${EXTRA_OPTS} \
+        --describe \
+        --topic "${TOPIC}"
+    done
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topic-setup
+  namespace: pulse
+  labels:
+    app: kafka-topic-setup
+    component: infra
+  annotations:
+    # Re-run the job by deleting the old one and re-applying:
+    #   kubectl delete job kafka-topic-setup -n pulse && kubectl apply -f kafka-setup-job.yaml -n pulse
+    description: "Idempotent Kafka topic provisioning job"
+spec:
+  backoffLimit: 5
+  activeDeadlineSeconds: 300   # fail after 5 min to avoid hanging deploys
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: kafka-topic-setup
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: kafka-setup
+          image: bitnami/kafka:3.7
+          command: ["/bin/bash", "/scripts/setup-topics.sh"]
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-kafka-secret
+                  key: brokers
+            - name: KAFKA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-kafka-secret
+                  key: api-key
+                  optional: true         # omit for plain-text (dev/CI) clusters
+            - name: KAFKA_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-kafka-secret
+                  key: api-secret
+                  optional: true
+          volumeMounts:
+            - name: setup-script
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: setup-script
+          configMap:
+            name: kafka-topic-setup-script
+            defaultMode: 0755
+---
+# ─── NetworkPolicy: allow kafka setup job to reach external Kafka brokers ──────
+# Opens egress to port 9092 (plain) and 9093 (TLS/SASL_SSL).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-egress
+  namespace: pulse
+spec:
+  podSelector:
+    matchLabels:
+      app: kafka-topic-setup
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 9092
+          protocol: TCP
+        - port: 9093
+          protocol: TCP
+        - port: 443
+          protocol: TCP   # Confluent REST API / Schema Registry
+---
+# ─── NetworkPolicy: allow all pulse pods to reach Kafka on 9092/9093 ──────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-producer-consumer-egress
+  namespace: pulse
+spec:
+  podSelector:
+    matchLabels:
+      component: ingest     # gateway
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 9092
+          protocol: TCP
+        - port: 9093
+          protocol: TCP

@@ -1,0 +1,303 @@
+openapi: "3.0.3"
+info:
+  title: PulseAnalytics — Ingest Gateway API
+  version: "1.0.0"
+  description: |
+    High-throughput event ingestion API. Accepts batches of up to 500 events
+    per request at up to 100M events/second across the cluster.
+  contact:
+    name: PulseAnalytics Support
+    url: https://pulse-analytics.io/support
+    email: support@pulse-analytics.io
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://gateway.pulse-analytics.io
+    description: Production
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: ingest
+    description: Event ingestion endpoints
+  - name: system
+    description: Health and readiness checks
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: Health check
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /v1/events:
+    post:
+      tags: [ingest]
+      summary: Ingest event batch
+      operationId: ingestEvents
+      description: |
+        Accepts a batch of up to 500 analytics events from SDK clients.
+        Returns 202 immediately after publishing to Kafka — does not wait for
+        downstream processing. Supports gzip compression via Content-Encoding.
+      parameters:
+        - name: Content-Encoding
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: [gzip]
+          description: Set to "gzip" if the body is gzip-compressed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EventBatch"
+      responses:
+        "202":
+          description: Accepted — events queued for processing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/track:
+    post:
+      tags: [ingest]
+      summary: Track a single event
+      operationId: trackEvent
+      description: Single-event shorthand. Equivalent to /v1/events with a one-event batch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Event"
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/identify:
+    post:
+      tags: [ingest]
+      summary: Identify / update user profile
+      operationId: identifyUser
+      description: |
+        Updates user profile traits. Triggers a user_updated event and upserts
+        the user document in MongoDB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdentifyRequest"
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key issued per application. Obtain from the PulseAnalytics dashboard.
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Unauthorized — invalid or missing API key
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    TooManyRequests:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        service:
+          type: string
+          example: gateway
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: invalid api key
+
+    IngestResponse:
+      type: object
+      properties:
+        accepted:
+          type: integer
+          example: 42
+          description: Number of new events accepted
+        filtered:
+          type: integer
+          example: 3
+          description: Duplicates filtered by bloom filter
+
+    EventBatch:
+      type: object
+      required: [app_id, device_id, events]
+      properties:
+        app_id:
+          type: string
+          example: app_abc123
+        device_id:
+          type: string
+          example: d1e2f3g4-h5i6-j7k8
+        user_id:
+          type: string
+          example: usr_xyz
+        sdk_version:
+          type: string
+          example: "2.1.0"
+        sent_at_ms:
+          type: integer
+          format: int64
+          example: 1712345678000
+        events:
+          type: array
+          maxItems: 500
+          items:
+            $ref: "#/components/schemas/Event"
+
+    Event:
+      type: object
+      required: [event_name]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          example: 550e8400-e29b-41d4-a716-446655440000
+        event_name:
+          type: string
+          example: purchase_completed
+        event_time:
+          type: integer
+          format: int64
+          example: 1712345678000
+          description: Client-side epoch milliseconds
+        props:
+          type: object
+          additionalProperties: true
+          example:
+            item_id: sku_999
+            price: 29.99
+        revenue:
+          type: number
+          format: double
+          example: 29.99
+        device:
+          $ref: "#/components/schemas/DeviceContext"
+        app:
+          $ref: "#/components/schemas/AppContext"
+
+    DeviceContext:
+      type: object
+      properties:
+        device_model:
+          type: string
+          example: iPhone 15 Pro
+        os:
+          type: string
+          example: iOS
+        os_version:
+          type: string
+          example: "17.4"
+        manufacturer:
+          type: string
+          example: Apple
+        network_type:
+          type: string
+          example: wifi
+        language:
+          type: string
+          example: en-US
+        timezone:
+          type: string
+          example: America/New_York
+        user_agent:
+          type: string
+          example: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4)"
+
+    AppContext:
+      type: object
+      properties:
+        version:
+          type: string
+          example: "4.2.1"
+        build:
+          type: string
+          example: "2024050100"
+        platform:
+          type: string
+          enum: [android, ios, web, react_native, flutter, server]
+        environment:
+          type: string
+          enum: [production, development]
+
+    IdentifyRequest:
+      type: object
+      required: [user_id]
+      properties:
+        user_id:
+          type: string
+          example: usr_xyz
+        traits:
+          type: object
+          additionalProperties: true
+          example:
+            email: alice@example.com
+            plan: pro

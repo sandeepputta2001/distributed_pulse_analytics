@@ -1,0 +1,46 @@
+openapi: "3.0.3"
+info:
+  title: Alert Engine
+  description: Internal health and metrics endpoints for the PulseAnalytics Alert Engine
+  version: "1.0.0"
+
+servers:
+  - url: http://localhost:8086
+    description: Local development
+
+paths:
+  /health:
+    get:
+      summary: Liveness check
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: alert-engine
+
+  /ready:
+    get:
+      summary: Readiness check
+      responses:
+        "200":
+          description: Service is ready to serve
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        "200":
+          description: Prometheus text format
+          content:
+            text/plain:
+              schema:
+                type: string

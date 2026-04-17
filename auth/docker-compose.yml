@@ -1,0 +1,64 @@
+version: "3.9"
+services:
+  auth:
+    build:
+      context: ..
+      dockerfile: auth/Dockerfile
+    image: pulse-analytics/auth:latest
+    container_name: pulse-auth
+    ports:
+      - "8083:8083"
+    environment:
+      - PULSE_SERVICE_ENVIRONMENT=development
+      - CONFIG_PATH=configs/config.yaml
+      - PULSE_REDIS_ADDRS=redis:6379
+      - PULSE_POSTGRES_DSN=postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable
+      - PULSE_AUTH_JWTSECRET=${PULSE_AUTH_JWTSECRET:-change-me-in-production-min-32-chars}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8083/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - pulse-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: pulse-redis-auth
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+    networks:
+      - pulse-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: pulse-postgres-auth
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: pulse
+      POSTGRES_DB: pulse
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ../migrations/postgres:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulse"]
+      interval: 5s
+      retries: 10
+    networks:
+      - pulse-net
+
+networks:
+  pulse-net:
+    driver: bridge
+volumes:
+  pg-data:

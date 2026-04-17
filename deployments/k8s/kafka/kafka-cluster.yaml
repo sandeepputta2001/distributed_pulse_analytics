@@ -1,0 +1,196 @@
+# ─── Strimzi Kafka Cluster — PulseAnalytics ───────────────────────────────────
+# Used for LOCAL DEV and CI only.
+# Production uses Confluent Cloud (managed); topics are provisioned via Terraform.
+#
+# Prerequisites:
+#   kubectl apply -f https://strimzi.io/install/latest?namespace=pulse
+#
+# Usage:
+#   kubectl apply -f kafka-cluster.yaml -n pulse
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: pulse-kafka
+  namespace: pulse
+spec:
+  kafka:
+    version: 3.7.0
+    replicas: 3
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+    config:
+      # Replication / durability
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      # Log defaults (overridden per-topic via KafkaTopic resources)
+      log.retention.ms: 172800000        # 48h default
+      log.retention.check.interval.ms: 300000
+      log.segment.ms: 3600000            # 1-hour segments
+      log.cleanup.policy: delete
+      # Compression
+      compression.type: snappy
+      # Message size limit (matches gateway 5 MB body limit)
+      message.max.bytes: 5242880
+      replica.fetch.max.bytes: 5242880
+      # Performance
+      num.network.threads: 8
+      num.io.threads: 16
+      num.partitions: 12                 # default for new topics
+      socket.send.buffer.bytes: 102400
+      socket.receive.buffer.bytes: 102400
+      socket.request.max.bytes: 104857600
+    storage:
+      type: jbod
+      volumes:
+        - id: 0
+          type: persistent-claim
+          size: 500Gi
+          class: standard-rwo            # GKE standard persistent disk
+          deleteClaim: false
+    resources:
+      requests:
+        memory: "8Gi"
+        cpu: "2000m"
+      limits:
+        memory: "16Gi"
+        cpu: "4000m"
+    jvmOptions:
+      -Xms: "4g"
+      -Xmx: "8g"
+      gcLoggingEnabled: false
+    readinessProbe:
+      initialDelaySeconds: 30
+      timeoutSeconds: 10
+    livenessProbe:
+      initialDelaySeconds: 30
+      timeoutSeconds: 10
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics-config
+          key: kafka-metrics-config.yml
+    template:
+      pod:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    strimzi.io/cluster: pulse-kafka
+                    strimzi.io/kind: Kafka
+  zookeeper:
+    replicas: 3
+    storage:
+      type: persistent-claim
+      size: 50Gi
+      class: standard-rwo
+      deleteClaim: false
+    resources:
+      requests:
+        memory: "1Gi"
+        cpu: "250m"
+      limits:
+        memory: "2Gi"
+        cpu: "500m"
+    jvmOptions:
+      -Xms: "512m"
+      -Xmx: "1g"
+    template:
+      pod:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    strimzi.io/cluster: pulse-kafka
+                    strimzi.io/kind: ZooKeeper
+  entityOperator:
+    topicOperator:
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+    userOperator:
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+---
+# ─── Kafka JMX / Prometheus metrics ConfigMap ──────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-metrics-config
+  namespace: pulse
+data:
+  kafka-metrics-config.yml: |
+    lowercaseOutputName: true
+    rules:
+      # Broker request metrics
+      - pattern: "kafka.server<type=BrokerTopicMetrics, name=(BytesIn|BytesOut|MessagesIn)PerSec, topic=(.+)><>OneMinuteRate"
+        name: kafka_server_broker_topic_$1_per_sec
+        labels:
+          topic: "$2"
+      # Under-replicated partitions — critical availability signal
+      - pattern: "kafka.server<type=ReplicaManager, name=UnderReplicatedPartitions><>Value"
+        name: kafka_server_replica_manager_under_replicated_partitions
+      # Consumer group lag (via JMX)
+      - pattern: "kafka.server<type=FetcherLagMetrics, name=ConsumerLag, clientId=(.+), topic=(.+), partition=(.+)><>Value"
+        name: kafka_server_fetcher_lag_consumer_lag
+        labels:
+          client_id: "$1"
+          topic: "$2"
+          partition: "$3"
+      # Request latency
+      - pattern: "kafka.network<type=RequestMetrics, name=TotalTimeMs, request=(.+)><>99thPercentile"
+        name: kafka_network_request_latency_p99_ms
+        labels:
+          request: "$1"
+      # Log size per topic
+      - pattern: "kafka.log<type=Log, name=Size, topic=(.+), partition=(.+)><>Value"
+        name: kafka_log_size_bytes
+        labels:
+          topic: "$1"
+          partition: "$2"
+---
+# ─── Service: plain (9092) and TLS (9093) listeners ──────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulse-kafka-bootstrap
+  namespace: pulse
+  labels:
+    app: pulse-kafka
+spec:
+  selector:
+    strimzi.io/cluster: pulse-kafka
+    strimzi.io/kind: Kafka
+    strimzi.io/name: pulse-kafka-kafka
+  ports:
+    - name: plain
+      port: 9092
+      targetPort: 9092
+    - name: tls
+      port: 9093
+      targetPort: 9093
+  type: ClusterIP

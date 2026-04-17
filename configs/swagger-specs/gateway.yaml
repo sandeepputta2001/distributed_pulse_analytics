@@ -1,0 +1,255 @@
+openapi: "3.0.3"
+info:
+  title: PulseAnalytics — Ingest Gateway
+  version: "1.0.0"
+  description: |
+    High-throughput event ingestion API. Accepts batches of up to 500 events per
+    request at up to 100M events/second across the cluster.
+  contact:
+    name: PulseAnalytics Support
+    url: https://pulse-analytics.io/support
+    email: support@pulse-analytics.io
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://gateway.pulse-analytics.io
+    description: Production
+
+tags:
+  - name: ingest
+    description: Event ingestion endpoints
+  - name: system
+    description: Health and readiness checks
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key issued per application. Obtain from the PulseAnalytics dashboard.
+
+  schemas:
+    Event:
+      type: object
+      required: [event_name, event_time]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: Client-generated idempotency key. Auto-generated if omitted.
+        event_name:
+          type: string
+          example: purchase_completed
+        event_time:
+          type: integer
+          format: int64
+          description: Client epoch milliseconds
+          example: 1700000000000
+        revenue:
+          type: number
+          format: double
+          example: 29.99
+        props:
+          type: object
+          additionalProperties: true
+          example: { "item_id": "sku_999", "quantity": 2 }
+        device:
+          $ref: '#/components/schemas/DeviceContext'
+        app:
+          $ref: '#/components/schemas/AppContext'
+
+    DeviceContext:
+      type: object
+      properties:
+        device_model: { type: string }
+        os:           { type: string }
+        os_version:   { type: string }
+        user_agent:   { type: string }
+        language:     { type: string }
+        timezone:     { type: string }
+
+    AppContext:
+      type: object
+      properties:
+        version:     { type: string }
+        platform:    { type: string, enum: [android, ios, web, react_native, flutter, server] }
+        environment: { type: string }
+
+    EventBatch:
+      type: object
+      required: [events]
+      properties:
+        device_id:
+          type: string
+          description: Persistent device identifier
+        user_id:
+          type: string
+          description: Authenticated user ID (optional)
+        sdk_version:
+          type: string
+          example: "2.1.0"
+        sent_at_ms:
+          type: integer
+          format: int64
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+          minItems: 1
+          maxItems: 500
+
+    IngestResponse:
+      type: object
+      properties:
+        accepted:
+          type: integer
+          description: Number of events accepted and queued
+        filtered:
+          type: integer
+          description: Number of duplicate events filtered
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      description: Returns 200 OK if the service process is running.
+      tags: [system]
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string, example: gateway }
+
+  /ready:
+    get:
+      summary: Readiness probe
+      description: Checks all critical dependencies (Kafka, Redis, Postgres).
+      tags: [system]
+      responses:
+        "200":
+          description: All dependencies healthy
+        "503":
+          description: One or more critical dependencies unhealthy
+
+  /v1/events:
+    post:
+      summary: Ingest event batch
+      description: |
+        Accepts a batch of up to 500 analytics events. Authenticates via X-API-Key,
+        applies per-app token-bucket rate limiting, deduplicates via Bloom filter +
+        Redis SET, and publishes to Kafka `raw-events` topic asynchronously.
+        Returns 202 immediately — fire and forget.
+      tags: [ingest]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: Content-Encoding
+          in: header
+          description: Set to 'gzip' when body is gzip-compressed
+          schema:
+            type: string
+            enum: [gzip]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventBatch'
+            example:
+              device_id: "device_abc123"
+              user_id: "user_001"
+              sdk_version: "2.1.0"
+              events:
+                - event_name: purchase_completed
+                  event_time: 1700000000000
+                  revenue: 29.99
+                  props: { item_id: "sku_999" }
+      responses:
+        "202":
+          description: Events accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        "400":
+          description: Invalid payload or batch size exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "401":
+          description: Missing or invalid X-API-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/identify:
+    post:
+      summary: Identify / update user profile
+      description: Updates user traits and emits a user_updated event.
+      tags: [ingest]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id:
+                  type: string
+                traits:
+                  type: object
+                  additionalProperties: true
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: user_id required
+        "401":
+          description: Unauthorized
+
+  /v1/track:
+    post:
+      summary: Track a single event
+      description: Single-event shorthand equivalent to POST /v1/events with one event.
+      tags: [ingest]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Event'
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: Invalid JSON
+        "401":
+          description: Unauthorized

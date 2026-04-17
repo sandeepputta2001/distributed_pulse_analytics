@@ -1,0 +1,10 @@
+service:
+  name: query-api
+
+http:
+  port: 8082
+  writetimeout: 60s   # allow longer for heavy queries
+
+telemetry:
+  servicename: "pulse-query-api"
+  samplingrate: 0.1    # 10% for query API

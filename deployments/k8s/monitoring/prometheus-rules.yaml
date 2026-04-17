@@ -1,0 +1,97 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: pulse-alerts
+  namespace: pulse
+  labels:
+    app: kube-prometheus-stack
+spec:
+  groups:
+    - name: pulse.ingest
+      interval: 30s
+      rules:
+        # Alert if ingest error rate > 1%
+        - alert: HighIngestErrorRate
+          expr: |
+            rate(pulse_ingest_errors_total[5m])
+            / rate(pulse_ingest_requests_total[5m]) > 0.01
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Ingest error rate > 1%"
+            description: "{{ $value | humanizePercentage }} of ingest requests are failing"
+
+        # Alert if ingest P95 latency > 200ms
+        - alert: HighIngestLatency
+          expr: |
+            histogram_quantile(0.95,
+              rate(pulse_ingest_latency_seconds_bucket[5m])
+            ) > 0.2
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Ingest P95 latency > 200ms"
+
+    - name: pulse.kafka
+      rules:
+        # Alert if Kafka consumer lag > 1M
+        - alert: KafkaConsumerLagHigh
+          expr: pulse_consumer_lag > 1000000
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Kafka consumer lag critical on {{ $labels.topic }}"
+            description: "Lag: {{ $value }} messages"
+
+        # Alert if Kafka produce error rate spikes
+        - alert: KafkaProduceErrors
+          expr: rate(pulse_kafka_produce_errors_total[5m]) > 100
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Kafka produce errors on {{ $labels.topic }}"
+
+    - name: pulse.clickhouse
+      rules:
+        # Alert if ClickHouse insert latency P95 > 5s
+        - alert: ClickHouseInsertLatencyHigh
+          expr: |
+            histogram_quantile(0.95,
+              rate(pulse_clickhouse_insert_latency_seconds_bucket[5m])
+            ) > 5
+          for: 5m
+          labels:
+            severity: warning
+
+        # Alert if ClickHouse query P95 > 1s
+        - alert: ClickHouseQueryLatencyHigh
+          expr: |
+            histogram_quantile(0.95,
+              rate(pulse_clickhouse_query_latency_seconds_bucket[5m])
+            ) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Query API P95 > 1s on {{ $labels.query_type }}"
+
+    - name: pulse.slo
+      rules:
+        # SLO: 99.9% of queries under 200ms
+        - alert: QuerySLOBreach
+          expr: |
+            (
+              1 - (
+                rate(pulse_clickhouse_query_latency_seconds_bucket{le="0.2"}[1h])
+                / rate(pulse_clickhouse_query_latency_seconds_count[1h])
+              )
+            ) > 0.001
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Query SLO breach: >0.1% of queries exceed 200ms"

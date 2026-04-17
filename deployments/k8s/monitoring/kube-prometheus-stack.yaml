@@ -1,0 +1,238 @@
+# ─── kube-prometheus-stack — Helm Values for AWS EKS ─────────────────────────
+#
+# Install:
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm repo update
+#   helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace -f this-file.yaml
+#
+# Upgrade:
+#   helm upgrade kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     -n monitoring -f this-file.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+nameOverride: "prometheus"
+
+# ─── Prometheus ───────────────────────────────────────────────────────────────
+prometheus:
+  prometheusSpec:
+    # Scrape every 15s globally; pulse metrics use 30s intervals
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    retention: 30d          # local retention; remote_write to Thanos/Mimir for long-term
+    retentionSize: 50GB
+
+    # Watch ALL namespaces for ServiceMonitors and PodMonitors
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+    # Additional scrape configs for pulse services with pod annotations
+    additionalScrapeConfigs:
+      - job_name: pulse-pod-metrics
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [pulse]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+
+    # Remote write to Grafana Cloud / Cortex / Thanos for long-term storage
+    # remoteWrite:
+    #   - url: https://prometheus-prod-xx-prod-xx.grafana.net/api/prom/push
+    #     basicAuth:
+    #       username:
+    #         name: grafana-cloud-secret
+    #         key: username
+    #       password:
+    #         name: grafana-cloud-secret
+    #         key: password
+
+    # EBS PVC for Prometheus data
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 100Gi
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        cpu: 2000m
+        memory: 8Gi
+
+    # Spread across AZs
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: topology.kubernetes.io/zone
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: prometheus
+
+# ─── Grafana ──────────────────────────────────────────────────────────────────
+grafana:
+  enabled: true
+  adminPassword: "REPLACE_WITH_GRAFANA_ADMIN_PASSWORD"
+
+  service:
+    type: ClusterIP
+    port: 3000
+
+  persistence:
+    enabled: true
+    storageClassName: gp3
+    size: 10Gi
+
+  # Auto-provision Grafana dashboards from ConfigMap
+  sidecar:
+    dashboards:
+      enabled: true
+      searchNamespace: ALL
+      label: grafana_dashboard
+      labelValue: "1"
+    datasources:
+      enabled: true
+      searchNamespace: ALL
+
+  grafana.ini:
+    server:
+      root_url: "https://grafana.internal.pulse-analytics.io"
+    auth:
+      disable_login_form: false
+    auth.anonymous:
+      enabled: false
+    security:
+      allow_embedding: true
+    feature_toggles:
+      enable: traceqlEditor
+
+  # Pre-configure Prometheus + Jaeger datasources
+  additionalDataSources:
+    - name: Jaeger
+      type: jaeger
+      url: http://jaeger-query.monitoring.svc.cluster.local:16686
+      access: proxy
+      isDefault: false
+    - name: Prometheus
+      type: prometheus
+      url: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+      isDefault: true
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# ─── Alertmanager ─────────────────────────────────────────────────────────────
+alertmanager:
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          resources:
+            requests:
+              storage: 5Gi
+
+  config:
+    global:
+      resolve_timeout: 5m
+      slack_api_url: "REPLACE_WITH_SLACK_WEBHOOK_URL"
+    route:
+      group_by: [alertname, app, severity]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: default
+      routes:
+        - matchers:
+            - severity = critical
+          receiver: pagerduty
+          continue: true
+        - matchers:
+            - severity = warning
+          receiver: slack
+
+    receivers:
+      - name: default
+        slack_configs:
+          - channel: "#pulse-alerts"
+            title: "{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}"
+            text: "{{ range .Alerts }}{{ .Annotations.description }}{{ end }}"
+
+      - name: slack
+        slack_configs:
+          - channel: "#pulse-alerts"
+            send_resolved: true
+            title: "[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}"
+            text: "{{ range .Alerts }}{{ .Annotations.description }}{{ end }}"
+
+      - name: pagerduty
+        pagerduty_configs:
+          - routing_key: "REPLACE_WITH_PAGERDUTY_INTEGRATION_KEY"
+            description: "{{ .GroupLabels.alertname }}"
+
+# ─── Node Exporter & Kube State Metrics ──────────────────────────────────────
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true
+
+# ─── Default Resource Requests ────────────────────────────────────────────────
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: false       # not exposed on managed EKS
+    configReloaders: true
+    general: true
+    k8s: true
+    kubeApiserverAvailability: true
+    kubeApiserverBurnrate: true
+    kubeApiserverHistogram: true
+    kubeApiserverSlos: true
+    kubelet: true
+    kubeProxy: false  # not used with AWS VPC CNI
+    kubePrometheusGeneral: true
+    kubePrometheusNodeRecording: true
+    kubernetesApps: true
+    kubernetesResources: true
+    kubernetesStorage: true
+    kubernetesSystem: true
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeStateMetrics: true
+    network: true
+    node: true
+    nodeExporterAlerting: true
+    nodeExporterRecording: true
+    prometheus: true
+    prometheusOperator: true

@@ -1,0 +1,145 @@
+# ─── Pulse Analytics — AWS ALB Ingress ───────────────────────────────────────
+#
+# Prerequisites:
+#   1. AWS Load Balancer Controller installed:
+#        helm repo add eks https://aws.github.io/eks-charts
+#        helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#          -n kube-system --set clusterName=<CLUSTER_NAME>
+#
+#   2. ACM certificate ARN (replace REPLACE_ACM_CERT_ARN below)
+#        aws acm request-certificate --domain-name "*.pulse-analytics.io" \
+#          --validation-method DNS
+#
+#   3. Subnets tagged:
+#        kubernetes.io/cluster/<cluster-name>=owned
+#        kubernetes.io/role/elb=1  (public subnets)
+# ──────────────────────────────────────────────────────────────────────────────
+
+---
+# Public ALB — terminates TLS, routes external traffic
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pulse-ingress
+  namespace: pulse
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip            # direct pod routing (no NodePort overhead)
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"         # auto-redirect HTTP → HTTPS
+    alb.ingress.kubernetes.io/certificate-arn: "REPLACE_ACM_CERT_ARN"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    # WAF association (optional — replace with your WAFv2 ACL ARN)
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: "arn:aws:wafv2:..."
+    # Sticky sessions for query-api (optional)
+    alb.ingress.kubernetes.io/load-balancer-attributes: |
+      routing.http.drop_invalid_header_fields.enabled=true,
+      deletion_protection.enabled=true,
+      idle_timeout.timeout_seconds=60
+    alb.ingress.kubernetes.io/group.name: pulse-alb-group   # share ALB across ingresses
+spec:
+  rules:
+    # ── Event Ingest API ──────────────────────────────────────────────────────
+    - host: ingest.pulse-analytics.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  name: http
+
+    # ── Query / Analytics API ─────────────────────────────────────────────────
+    - host: api.pulse-analytics.io
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: query-api
+                port:
+                  name: http
+
+    # ── Auth Service ──────────────────────────────────────────────────────────
+    - host: auth.pulse-analytics.io
+      http:
+        paths:
+          - path: /v1/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  name: http
+
+    # ── Notification / Campaign API ───────────────────────────────────────────
+    - host: engage.pulse-analytics.io
+      http:
+        paths:
+          - path: /v1/campaigns
+            pathType: Prefix
+            backend:
+              service:
+                name: notification-service
+                port:
+                  name: http
+
+---
+# Internal ALB — observability UIs accessible only from within VPC / VPN
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pulse-internal-ingress
+  namespace: pulse
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal           # VPC-only, not public internet
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: "REPLACE_ACM_CERT_ARN"
+    alb.ingress.kubernetes.io/group.name: pulse-internal-alb-group
+spec:
+  rules:
+    # Grafana dashboards
+    - host: grafana.internal.pulse-analytics.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+
+    # Jaeger trace explorer
+    - host: jaeger.internal.pulse-analytics.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jaeger-query
+                port:
+                  number: 16686
+
+    # Prometheus (read-only, VPN-gated)
+    - host: prometheus.internal.pulse-analytics.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus
+                port:
+                  number: 9090

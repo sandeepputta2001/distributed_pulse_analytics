@@ -1,0 +1,32 @@
+openapi: "3.0.3"
+info:
+  title: Session Engine
+  description: Internal health and metrics for the PulseAnalytics Session Engine
+  version: "1.0.0"
+
+servers:
+  - url: http://localhost:8083
+
+paths:
+  /health:
+    get:
+      summary: Liveness
+      responses:
+        "200":
+          description: OK
+  /ready:
+    get:
+      summary: Readiness
+      responses:
+        "200":
+          description: OK
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        "200":
+          description: Prometheus text
+          content:
+            text/plain:
+              schema:
+                type: string

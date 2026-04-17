@@ -1,0 +1,30 @@
+service:
+  name: alert-engine
+  environment: development
+
+http:
+  host: "0.0.0.0"
+  port: 8086
+
+postgres:
+  dsn: "postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable"
+
+clickhouse:
+  hosts:
+    - "clickhouse:9000"
+  database: "pulse"
+  username: "pulse"
+  password: ""
+
+kafka:
+  brokers:
+    - "kafka:9092"
+  topicnotify: "notifications"
+  consumergroup: "alert-engine"
+
+telemetry:
+  otlpendpoint: "otel-collector:4317"
+  servicename: "pulse-alert-engine"
+  samplingrate: 0.1
+  metricsenabled: true
+  tracingenabled: true

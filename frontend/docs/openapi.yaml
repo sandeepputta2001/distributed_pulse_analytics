@@ -1,0 +1,44 @@
+openapi: "3.0.3"
+info:
+  title: Frontend
+  description: |
+    The PulseAnalytics frontend is a React SPA served by nginx.
+    It has no public API surface — all data access goes through the Gateway and Query API.
+    This document describes the nginx proxy routes exposed to browsers.
+  version: "1.0.0"
+
+servers:
+  - url: http://localhost:3000
+    description: Local development (nginx)
+
+paths:
+  /:
+    get:
+      summary: SPA root — serves index.html
+      responses:
+        "200":
+          description: React application shell
+
+  /api/{path}:
+    get:
+      summary: Proxy to Gateway (GET requests)
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Response proxied from Gateway
+    post:
+      summary: Proxy to Gateway (POST requests)
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Response proxied from Gateway

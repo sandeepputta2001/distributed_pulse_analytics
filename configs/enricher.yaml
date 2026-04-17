@@ -1,0 +1,9 @@
+service:
+  name: enricher
+
+kafka:
+  consumergroup: "enricher-group"
+  compression: snappy
+
+telemetry:
+  servicename: "pulse-enricher"

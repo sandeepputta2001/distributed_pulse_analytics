@@ -1,0 +1,33 @@
+service:
+  name: query-api
+  environment: development
+
+http:
+  host: "0.0.0.0"
+  port: 8085
+
+auth:
+  jwtsecret: "dev-secret-change-in-production-32chars"
+
+postgres:
+  dsn: "postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable"
+
+clickhouse:
+  hosts:
+    - "clickhouse:9000"
+  database: "pulse"
+  username: "pulse"
+  password: ""
+
+redis:
+  addrs:
+    - "redis:6379"
+  password: ""
+  db: 0
+
+telemetry:
+  otlpendpoint: "otel-collector:4317"
+  servicename: "pulse-query-api"
+  samplingrate: 0.1
+  metricsenabled: true
+  tracingenabled: true

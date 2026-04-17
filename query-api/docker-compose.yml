@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  query-api:
+    build:
+      context: ..
+      dockerfile: query-api/Dockerfile
+    ports:
+      - "8085:8085"
+      - "9094:9094"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+      JWT_SECRET: dev-secret-change-me
+    depends_on:
+      - postgres
+      - clickhouse
+      - redis
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: pulse
+      POSTGRES_DB: pulse
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
+  clickhouse_data:

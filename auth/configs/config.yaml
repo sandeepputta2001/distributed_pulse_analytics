@@ -1,0 +1,33 @@
+service:
+  name: auth
+  environment: development
+
+http:
+  host: "0.0.0.0"
+  port: 8083
+  readtimeout: 10s
+  writetimeout: 10s
+  idletimeout: 60s
+  shutdowntimeout: 15s
+
+redis:
+  addrs: ["localhost:6379"]
+  poolsize: 20
+  maxretries: 3
+
+postgres:
+  dsn: "postgres://pulse:pulse@localhost:5432/pulse?sslmode=disable"
+  maxopenconn: 10
+  maxidleconn: 3
+  maxlifetime: 30m
+
+auth:
+  jwtsecret: "change-me-in-production-min-32-chars"
+  apikeycachettl: 5m
+  jwtexpiry: 24h
+
+telemetry:
+  otlpendpoint: "localhost:4317"
+  samplingrate: 0.1
+  metricsenabled: true
+  tracingenabled: true

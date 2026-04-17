@@ -1,0 +1,519 @@
+openapi: "3.0.3"
+info:
+  title: PulseAnalytics — Query API
+  version: "1.0.0"
+  description: |
+    Analytics query service for funnels, retention, DAU/WAU/MAU, session
+    metrics, and event counts. Backed by ClickHouse with 3-tier caching
+    (in-process → Redis → ClickHouse query_cache). P95 < 200ms on 10B+ rows.
+  contact:
+    name: PulseAnalytics Support
+    url: https://pulse-analytics.io/support
+    email: support@pulse-analytics.io
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8082
+    description: Local development
+  - url: https://query.pulse-analytics.io
+    description: Production
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: analytics
+    description: Core analytics query endpoints
+  - name: funnels
+    description: Funnel definition management
+  - name: system
+    description: Health and operational checks
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: Health check
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /v1/events/count:
+    get:
+      tags: [analytics]
+      summary: Event count over time
+      operationId: eventCount
+      description: |
+        Returns event counts bucketed by the chosen granularity. Hits
+        ClickHouse Materialized Views for sub-100ms responses on large datasets.
+      parameters:
+        - name: app_id
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Application ID
+        - name: event_name
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to a specific event name (omit for all events)
+        - name: from_ms
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Start epoch ms (default: 30 days ago)
+        - name: to_ms
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: End epoch ms (default: now)
+        - name: granularity
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [minute, hour, day, week, month]
+            default: day
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventCountResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/funnels/query:
+    post:
+      tags: [analytics]
+      summary: Funnel conversion analysis
+      operationId: funnelQuery
+      description: |
+        Computes step-by-step funnel conversion rates using ClickHouse
+        windowFunnel(). Runs in <200ms on 10B rows with partition pruning.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FunnelRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FunnelResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/dau:
+    get:
+      tags: [analytics]
+      summary: Active users (DAU/WAU/MAU)
+      operationId: dau
+      description: |
+        Daily, weekly, or monthly active users using HyperLogLog (uniqHLL12)
+        for approximate counting at massive scale (~2% error rate at any scale).
+      parameters:
+        - name: app_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: from_ms
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - name: to_ms
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - name: granularity
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [day, week, month]
+            default: day
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventCountResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/retention:
+    post:
+      tags: [analytics]
+      summary: Day-N retention cohorts
+      operationId: retention
+      description: |
+        Day-N retention cohort analysis. Returns % of users who installed on
+        day 0 and returned on day N for each install cohort.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RetentionRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetentionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/sessions/metrics:
+    get:
+      tags: [analytics]
+      summary: Session metrics
+      operationId: sessionMetrics
+      description: |
+        Aggregated session metrics: average duration, median duration,
+        total sessions, and average events per session.
+      parameters:
+        - name: app_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: from_ms
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - name: to_ms
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionMetricsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/funnels:
+    post:
+      tags: [funnels]
+      summary: Create funnel definition
+      operationId: createFunnel
+      description: Creates a named funnel definition with ordered steps and a conversion time window.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateFunnelRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateFunnelResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/funnels/{app_id}:
+    get:
+      tags: [funnels]
+      summary: List funnel definitions
+      operationId: listFunnels
+      description: Lists all funnel definitions for the given application.
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/FunnelDefinition"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT bearer token. Format — "Bearer <token>"
+
+  responses:
+    BadRequest:
+      description: Bad request — validation error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        service:
+          type: string
+          example: query-api
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: app_id required
+
+    DataPoint:
+      type: object
+      properties:
+        timestamp_ms:
+          type: integer
+          format: int64
+          example: 1712304000000
+        value:
+          type: number
+          format: double
+          example: 142500
+        dimensions:
+          type: object
+          additionalProperties:
+            type: string
+
+    EventCountResponse:
+      type: object
+      properties:
+        points:
+          type: array
+          items:
+            $ref: "#/components/schemas/DataPoint"
+        total:
+          type: integer
+          format: int64
+          example: 4275000
+
+    FunnelRequest:
+      type: object
+      required: [app_id, steps]
+      properties:
+        app_id:
+          type: string
+          example: app_abc123
+        steps:
+          type: array
+          minItems: 2
+          maxItems: 10
+          items:
+            type: string
+          example: [app_installed, user_registered, purchase_completed]
+        window_seconds:
+          type: integer
+          format: int64
+          default: 604800
+          example: 604800
+          description: Max time allowed between first and last step (default 7 days)
+        from_ms:
+          type: integer
+          format: int64
+          example: 1709596800000
+        to_ms:
+          type: integer
+          format: int64
+          example: 1712188800000
+
+    FunnelStep:
+      type: object
+      properties:
+        event_name:
+          type: string
+          example: user_registered
+        user_count:
+          type: integer
+          format: int64
+          example: 85000
+        conversion_rate:
+          type: number
+          format: double
+          example: 0.85
+        drop_off_rate:
+          type: number
+          format: double
+          example: 0.15
+
+    FunnelResponse:
+      type: object
+      properties:
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/FunnelStep"
+
+    RetentionRequest:
+      type: object
+      required: [app_id]
+      properties:
+        app_id:
+          type: string
+          example: app_abc123
+        from_ms:
+          type: integer
+          format: int64
+        to_ms:
+          type: integer
+          format: int64
+        day_ns:
+          type: array
+          items:
+            type: integer
+            format: int32
+          default: [1, 3, 7, 14, 30]
+
+    RetentionCohort:
+      type: object
+      properties:
+        install_date:
+          type: string
+          format: date
+          example: "2024-04-01"
+        cohort_size:
+          type: integer
+          format: int64
+          example: 12500
+        day_n_rates:
+          type: object
+          additionalProperties:
+            type: number
+            format: double
+          example:
+            day_1: 0.42
+            day_3: 0.28
+            day_7: 0.19
+            day_14: 0.13
+            day_30: 0.08
+
+    RetentionResponse:
+      type: object
+      properties:
+        cohorts:
+          type: array
+          items:
+            $ref: "#/components/schemas/RetentionCohort"
+
+    SessionMetricsResponse:
+      type: object
+      properties:
+        avg_session_duration_s:
+          type: number
+          format: double
+          example: 187.4
+        median_session_duration_s:
+          type: number
+          format: double
+          example: 142.0
+        total_sessions:
+          type: integer
+          format: int64
+          example: 4200000
+        avg_events_per_session:
+          type: number
+          format: double
+          example: 12.3
+
+    CreateFunnelRequest:
+      type: object
+      required: [app_id, name, steps]
+      properties:
+        app_id:
+          type: string
+          example: app_abc123
+        name:
+          type: string
+          example: Onboarding Funnel
+        steps:
+          type: array
+          items:
+            type: string
+          example: [app_installed, user_registered, purchase_completed]
+        window_seconds:
+          type: integer
+          format: int64
+          default: 604800
+
+    CreateFunnelResponse:
+      type: object
+      properties:
+        funnel_id:
+          type: string
+          example: f-1712345678000000000
+
+    FunnelDefinition:
+      type: object
+      properties:
+        funnel_id:
+          type: string
+        app_id:
+          type: string
+        name:
+          type: string
+        steps:
+          type: array
+          items:
+            type: string
+        window_seconds:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time

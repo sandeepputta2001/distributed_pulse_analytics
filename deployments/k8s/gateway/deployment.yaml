@@ -1,0 +1,162 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: pulse
+  labels:
+    app: gateway
+    component: ingest
+spec:
+  replicas: 10            # HPA will scale 10–200 based on RPS
+  selector:
+    matchLabels:
+      app: gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0   # zero-downtime deployments
+  template:
+    metadata:
+      labels:
+        app: gateway
+        component: ingest
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: gateway
+          image: ${ECR_REGISTRY}/pulse-gateway:${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          env:
+            - name: CONFIG_PATH
+              value: /app/configs/gateway.yaml
+            - name: PULSE_SERVICE_ENVIRONMENT
+              value: production
+            - name: PULSE_KAFKA_BROKERS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-kafka-secret
+                  key: brokers
+            - name: PULSE_REDIS_ADDRS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-redis-secret
+                  key: addrs
+            - name: PULSE_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-postgres-secret
+                  key: dsn
+            - name: PULSE_AUTH_JWTSECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-auth-secret
+                  key: jwt-secret
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+            - name: geoip
+              mountPath: /data
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 2
+      volumes:
+        - name: configs
+          configMap:
+            name: pulse-configs
+        - name: geoip
+          persistentVolumeClaim:
+            claimName: geoip-pvc
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: gateway
+                topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: pulse
+  labels:
+    app: gateway
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway-hpa
+  namespace: pulse
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  minReplicas: 10
+  maxReplicas: 200
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Pods
+      pods:
+        metric:
+          name: pulse_ingest_requests_total
+        target:
+          type: AverageValue
+          averageValue: "5000"   # 5K RPS per pod
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300

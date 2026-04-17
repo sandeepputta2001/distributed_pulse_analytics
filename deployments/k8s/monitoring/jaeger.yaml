@@ -1,0 +1,151 @@
+# ─── Jaeger — All-in-One (dev/staging) + Production setup ────────────────────
+#
+# For PRODUCTION on EKS, use Jaeger Operator:
+#   kubectl create namespace observability
+#   kubectl apply -f https://github.com/jaegertracing/jaeger-operator/releases/download/v1.57.0/jaeger-operator.yaml -n observability
+# Then apply the Jaeger CR below.
+#
+# For DEVELOPMENT (all-in-one, in-memory):
+#   kubectl apply -f this file (using the all-in-one Deployment section)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── PRODUCTION: Jaeger via Operator ─────────────────────────────────────────
+# Stores traces in Elasticsearch/OpenSearch on AWS (recommended for scale).
+# Uncomment and configure when using Jaeger Operator.
+#
+# apiVersion: jaegertracing.io/v1
+# kind: Jaeger
+# metadata:
+#   name: pulse-jaeger
+#   namespace: monitoring
+# spec:
+#   strategy: production
+#   collector:
+#     maxReplicas: 5
+#     resources:
+#       limits: {memory: 1Gi, cpu: 500m}
+#   query:
+#     replicas: 2
+#   storage:
+#     type: elasticsearch
+#     options:
+#       es:
+#         server-urls: https://REPLACE_OPENSEARCH_ENDPOINT:9200
+#         index-prefix: pulse-traces
+#         tls.enabled: true
+#   ingress:
+#     enabled: false   # expose via pulse-internal-ingress
+
+# ─── DEVELOPMENT: All-in-one (in-memory, single pod) ─────────────────────────
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: monitoring
+  labels:
+    app: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.57
+          env:
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+            - name: SPAN_STORAGE_TYPE
+              value: memory
+            - name: MEMORY_MAX_TRACES
+              value: "100000"
+          ports:
+            - name: ui
+              containerPort: 16686
+              protocol: TCP
+            - name: grpc-collector
+              containerPort: 14250
+              protocol: TCP
+            - name: http-collector
+              containerPort: 14268
+              protocol: TCP
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: ui
+            initialDelaySeconds: 10
+            periodSeconds: 15
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-query  
+  namespace: monitoring
+  labels:
+    app: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: ui
+      port: 16686
+      targetPort: ui
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-collector
+  namespace: monitoring
+  labels:
+    app: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: grpc
+      port: 14250
+      targetPort: grpc-collector
+    - name: http
+      port: 14268
+      targetPort: http-collector
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+  type: ClusterIP
+
+---
+# ServiceMonitor so Prometheus scrapes Jaeger's own metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: jaeger-monitor
+  namespace: monitoring
+  labels:
+    app: jaeger
+spec:
+  selector:
+    matchLabels:
+      app: jaeger
+  endpoints:
+    - port: ui
+      path: /metrics
+      interval: 30s

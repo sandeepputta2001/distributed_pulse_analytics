@@ -1,0 +1,117 @@
+# ─── Pulse Analytics — Persistent Volumes ────────────────────────────────────
+#
+# AWS EKS storage classes used:
+#   gp3         — general purpose SSD (default, good for most workloads)
+#   io2         — provisioned IOPS SSD (ClickHouse, high-throughput)
+#
+# The EBS CSI Driver must be installed on the cluster:
+#   aws eks create-addon --cluster-name <cluster> --addon-name aws-ebs-csi-driver
+# ──────────────────────────────────────────────────────────────────────────────
+
+---
+# GeoIP database — shared ReadOnlyMany volume for gateway + enricher pods.
+# Populated by a CronJob that downloads the MaxMind GeoLite2-City.mmdb weekly.
+# Note: EBS does NOT support ReadWriteMany — use EFS for multi-pod shared reads.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: geoip-pvc
+  namespace: pulse
+  labels:
+    app: geoip
+spec:
+  accessModes:
+    - ReadWriteOnce   # on EFS use ReadWriteMany; EBS only supports RWO
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+# CronJob that refreshes the GeoIP database weekly from MaxMind.
+# Requires MAXMIND_LICENSE_KEY secret.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: geoip-updater
+  namespace: pulse
+spec:
+  schedule: "0 3 * * 0"  # 03:00 UTC every Sunday
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: geoip-updater
+              image: alpine:3.20
+              command:
+                - sh
+                - -c
+                - |
+                  apk add --no-cache curl tar
+                  curl -sSL \
+                    "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" \
+                    -o /tmp/geoip.tar.gz
+                  tar -xzf /tmp/geoip.tar.gz -C /tmp --strip-components=1
+                  mv /tmp/GeoLite2-City.mmdb /data/GeoLite2-City.mmdb
+                  echo "GeoIP updated successfully"
+              env:
+                - name: MAXMIND_LICENSE_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: pulse-maxmind-secret
+                      key: license-key
+              volumeMounts:
+                - name: geoip
+                  mountPath: /data
+          volumes:
+            - name: geoip
+              persistentVolumeClaim:
+                claimName: geoip-pvc
+
+---
+# StorageClass for GP3 EBS volumes (EKS default override)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer  # schedule pod first, then provision in same AZ
+reclaimPolicy: Retain
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+  encrypted: "true"
+
+---
+# StorageClass for IO2 EBS (ClickHouse high-throughput)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: io2-high-iops
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+parameters:
+  type: io2
+  iops: "16000"
+  encrypted: "true"
+
+---
+# StorageClass for EFS (shared ReadWriteMany — GeoIP alternative)
+# Requires the AWS EFS CSI Driver:
+#   aws eks create-addon --cluster-name <cluster> --addon-name aws-efs-csi-driver
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-shared
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: REPLACE_WITH_EFS_FILE_SYSTEM_ID
+  directoryPerms: "700"

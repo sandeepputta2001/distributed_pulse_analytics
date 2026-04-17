@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: session
+  namespace: pulse
+  labels:
+    app: session
+    component: processing
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: session
+  template:
+    metadata:
+      labels:
+        app: session
+        component: processing
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: session
+          image: ${ECR_REGISTRY}/pulse-session:${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports:
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          env:
+            - name: CONFIG_PATH
+              value: /app/configs/base.yaml
+            - name: PULSE_SERVICE_ENVIRONMENT
+              value: production
+            - name: PULSE_KAFKA_BROKERS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-kafka-secret
+                  key: brokers
+            - name: PULSE_REDIS_ADDRS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-redis-secret
+                  key: addrs
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "kill -0 1"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: configs
+          configMap:
+            name: pulse-configs
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: session
+                topologyKey: kubernetes.io/hostname
+---
+# KEDA ScaledObject — scale on enriched-events Kafka consumer lag
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: session-scaledobject
+  namespace: pulse
+spec:
+  scaleTargetRef:
+    name: session
+  minReplicaCount: 3
+  maxReplicaCount: 60
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka-cluster:9092
+        consumerGroup: session-group
+        topic: enriched-events
+        lagThreshold: "30000"   # scale up if lag exceeds 30K messages

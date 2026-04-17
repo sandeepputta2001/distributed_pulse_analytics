@@ -1,0 +1,41 @@
+service:
+  name: funnel
+  environment: development
+
+kafka:
+  brokers: ["localhost:9092"]
+  topicrawevents: raw-events
+  topicenriched: enriched-events
+  topicsession: session-events
+  topicaggresults: agg-results
+  topicdlq: dlq-events
+  producerbatch: 1000
+  producerlinger: 5ms
+  acks: leader
+  compression: snappy
+
+redis:
+  addrs: ["localhost:6379"]
+  poolsize: 20
+  maxretries: 3
+
+postgres:
+  dsn: "postgres://pulse:pulse@localhost:5432/pulse?sslmode=disable"
+  maxopenconn: 10
+  maxidleconn: 3
+  maxlifetime: 30m
+
+clickhouse:
+  hosts: ["localhost:9000"]
+  database: pulse
+  username: pulse
+  maxopenconn: 20
+
+geoip:
+  dbpath: "/data/GeoLite2-City.mmdb"
+
+telemetry:
+  otlpendpoint: "localhost:4317"
+  samplingrate: 0.01
+  metricsenabled: true
+  tracingenabled: true

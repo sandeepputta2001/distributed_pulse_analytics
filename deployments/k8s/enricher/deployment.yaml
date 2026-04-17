@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enricher
+  namespace: pulse
+  labels:
+    app: enricher
+    component: processing
+spec:
+  replicas: 20
+  selector:
+    matchLabels:
+      app: enricher
+  template:
+    metadata:
+      labels:
+        app: enricher
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: enricher
+          image: ${ECR_REGISTRY}/pulse-enricher:${IMAGE_TAG}
+          imagePullPolicy: Always
+          env:
+            - name: CONFIG_PATH
+              value: /app/configs/enricher.yaml
+            - name: PULSE_SERVICE_ENVIRONMENT
+              value: production
+            - name: PULSE_KAFKA_BROKERS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-kafka-secret
+                  key: brokers
+            - name: PULSE_REDIS_ADDRS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-redis-secret
+                  key: addrs
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+            - name: geoip
+              mountPath: /data
+              readOnly: true
+          ports:
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "1Gi"     # GeoIP DB loaded in-memory (~50MB)
+            limits:
+              cpu: "4000m"
+              memory: "2Gi"
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "kill -0 1"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "kill -0 1"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 2
+      volumes:
+        - name: configs
+          configMap:
+            name: pulse-configs
+        - name: geoip
+          persistentVolumeClaim:
+            claimName: geoip-pvc
+---
+# KEDA ScaledObject — scale based on Kafka consumer lag
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: enricher-scaledobject
+  namespace: pulse
+spec:
+  scaleTargetRef:
+    name: enricher
+  minReplicaCount: 5
+  maxReplicaCount: 100
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka-cluster:9092
+        consumerGroup: enricher-group
+        topic: raw-events
+        lagThreshold: "50000"    # scale up if lag exceeds 50K msgs

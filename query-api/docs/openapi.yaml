@@ -1,0 +1,388 @@
+openapi: "3.0.3"
+info:
+  title: Query API
+  description: Analytics query and management endpoints for PulseAnalytics
+  version: "1.0.0"
+
+servers:
+  - url: http://localhost:8085
+    description: Local development
+
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+
+    TimeSeries:
+      type: object
+      properties:
+        bucket:
+          type: string
+          format: date-time
+        count:
+          type: integer
+
+    EventCountResponse:
+      type: object
+      properties:
+        series:
+          type: array
+          items:
+            $ref: "#/components/schemas/TimeSeries"
+
+    FunnelStep:
+      type: object
+      properties:
+        step:
+          type: integer
+        event_name:
+          type: string
+        count:
+          type: integer
+        conversion_rate:
+          type: number
+
+    FunnelResponse:
+      type: object
+      properties:
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/FunnelStep"
+
+    RetentionRow:
+      type: object
+      properties:
+        cohort_date:
+          type: string
+          format: date
+        day_n:
+          type: integer
+        retained_users:
+          type: integer
+        retention_rate:
+          type: number
+
+    AlertRule:
+      type: object
+      properties:
+        id:
+          type: string
+        app_id:
+          type: string
+        metric:
+          type: string
+        operator:
+          type: string
+        threshold:
+          type: number
+        window_minutes:
+          type: integer
+        active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    FunnelDefinition:
+      type: object
+      properties:
+        funnel_id:
+          type: string
+        app_id:
+          type: string
+        name:
+          type: string
+        steps:
+          type: array
+          items:
+            type: string
+
+    Experiment:
+      type: object
+      properties:
+        id:
+          type: string
+        app_id:
+          type: string
+        name:
+          type: string
+        variants:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          enum: [draft, running, stopped]
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      security: []
+      responses:
+        "200":
+          description: OK
+
+  /v1/events/count:
+    get:
+      summary: Event count time-series
+      parameters:
+        - name: app_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: event_name
+          in: query
+          schema:
+            type: string
+        - name: from_ms
+          in: query
+          schema:
+            type: integer
+        - name: to_ms
+          in: query
+          schema:
+            type: integer
+        - name: granularity
+          in: query
+          schema:
+            type: string
+            enum: [hour, day, week]
+      responses:
+        "200":
+          description: Time-series counts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventCountResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/funnels/query:
+    post:
+      summary: Funnel conversion rates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [app_id, steps]
+              properties:
+                app_id:
+                  type: string
+                steps:
+                  type: array
+                  items:
+                    type: string
+                from_ms:
+                  type: integer
+                to_ms:
+                  type: integer
+                window_seconds:
+                  type: integer
+      responses:
+        "200":
+          description: Funnel steps
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FunnelResponse"
+
+  /v1/dau:
+    get:
+      summary: Active user counts (DAU/WAU/MAU)
+      parameters:
+        - name: app_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: granularity
+          in: query
+          schema:
+            type: string
+            enum: [day, week, month]
+        - name: from_ms
+          in: query
+          schema:
+            type: integer
+        - name: to_ms
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Active user time-series
+
+  /v1/retention:
+    post:
+      summary: Day-N retention cohorts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [app_id]
+              properties:
+                app_id:
+                  type: string
+                day_ns:
+                  type: array
+                  items:
+                    type: integer
+      responses:
+        "200":
+          description: Retention rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RetentionRow"
+
+  /v1/sessions/metrics:
+    get:
+      summary: Session KPIs (duration, count, events/session)
+      parameters:
+        - name: app_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: from_ms
+          in: query
+          schema:
+            type: integer
+        - name: to_ms
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Session metrics
+
+  /v1/alerts:
+    get:
+      summary: List alert rules
+      parameters:
+        - name: app_id
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of alert rules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AlertRule"
+    post:
+      summary: Create alert rule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlertRule"
+      responses:
+        "201":
+          description: Created alert rule
+
+  /v1/alerts/{id}:
+    put:
+      summary: Update alert rule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlertRule"
+      responses:
+        "200":
+          description: Updated
+    delete:
+      summary: Delete alert rule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+
+  /v1/experiments:
+    get:
+      summary: List experiments
+      parameters:
+        - name: app_id
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Experiments
+    post:
+      summary: Create experiment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Experiment"
+      responses:
+        "201":
+          description: Created
+
+  /v1/experiments/{id}:
+    put:
+      summary: Update experiment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated
+    delete:
+      summary: Delete experiment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted

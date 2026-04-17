@@ -1,0 +1,102 @@
+# Base configuration — override per service via CONFIG_PATH env var
+# All values can be overridden via PULSE_* environment variables
+# e.g. PULSE_KAFKA_BROKERS, PULSE_REDIS_ADDRS, etc.
+
+service:
+  environment: development
+  loglevel: info
+
+http:
+  host: "0.0.0.0"
+  port: 8080
+  readtimeout: 10s
+  writetimeout: 30s
+  idletimeout: 60s
+  shutdowntimeout: 15s
+  maxbodybytes: 10485760  # 10MB
+
+grpc:
+  host: "0.0.0.0"
+  port: 9090
+
+kafka:
+  brokers:
+    - "kafka-1:9092"
+    - "kafka-2:9092"
+    - "kafka-3:9092"
+  topicrawevents:  "raw-events"
+  topicenriched:   "enriched-events"
+  topicsession:    "session-events"
+  topicaggresults: "agg-results"
+  topicdlq:        "dlq-events"
+  topicnotify:     "notifications"
+  consumergroup:   "pulse-consumer"
+  producerbatch:   1000
+  producerlinger:  5ms
+  acks:            "leader"
+  compression:     "snappy"
+  tls:             false
+
+redis:
+  addrs:
+    - "redis-cluster-0:6379"
+    - "redis-cluster-1:6379"
+    - "redis-cluster-2:6379"
+  password: ""
+  poolsize: 100
+  maxretries: 3
+  dialtimeout: 5s
+  readtimeout: 3s
+  writetimeout: 3s
+
+clickhouse:
+  hosts:
+    - "clickhouse-1:9000"
+    - "clickhouse-2:9000"
+  database: "pulse"
+  username: "pulse"
+  password: ""
+  maxopenconn: 20
+  maxidleconn: 5
+  dialtimeout: 10s
+  tls: false
+  debug: false
+
+postgres:
+  dsn: "postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable"
+  maxopenconn: 25
+  maxidleconn: 5
+  maxlifetime: 30m
+
+mongo:
+  uri: "mongodb://mongo:27017"
+  database: "pulse"
+  timeout: 10s
+
+geoip:
+  dbpath: "/data/GeoLite2-City.mmdb"
+
+auth:
+  jwtsecret: "CHANGE-ME-USE-VAULT-IN-PROD"
+  apikeycachettl: 5m
+  jwtexpiry: 24h
+
+ratelimit:
+  enabled: true
+  defaultrps: 10000.0
+  defaultburst: 50000
+  windowsize: 1s
+  cleanupinterval: 5m
+
+bloom:
+  capacity: 1000000000   # 1B
+  falsepositive: 0.001   # 0.1%
+  windowttl: 24h
+
+telemetry:
+  otlpendpoint: "otel-collector:4317"
+  prometheusport: 9091
+  servicename: "pulse-analytics"
+  samplingrate: 0.01      # 1% normal traffic
+  metricsenabled: true
+  tracingenabled: true

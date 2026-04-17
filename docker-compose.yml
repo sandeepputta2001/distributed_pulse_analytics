@@ -1,0 +1,466 @@
+version: "3.9"
+
+# ─── Local development stack ──────────────────────────────────────────────────
+# Provides all infrastructure dependencies.
+# Services connect via the 'pulse' network using service names as hostnames.
+
+networks:
+  pulse:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  zookeeper-data:
+  clickhouse-data:
+  postgres-data:
+  mongo-data:
+  redis-data:
+
+services:
+
+  # ─── Zookeeper (Kafka dependency) ─────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    hostname: zookeeper
+    networks: [pulse]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Kafka (single broker for local dev) ──────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    networks: [pulse]
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 12
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9094"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ─── Kafka Topic Init ────────────────────────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [pulse]
+    command: |
+      bash -c "
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --replication-factor 1 --partitions 12 --topic raw-events &&
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --replication-factor 1 --partitions 12 --topic enriched-events &&
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --replication-factor 1 --partitions 6  --topic session-events &&
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --replication-factor 1 --partitions 4  --topic agg-results &&
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --replication-factor 1 --partitions 2  --topic dlq-events &&
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --replication-factor 1 --partitions 2  --topic notifications &&
+        echo 'Kafka topics created'
+      "
+
+  # ─── Redis (single node for local dev) ──────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    hostname: redis
+    networks: [pulse]
+    ports:
+      - "6380:6379"
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru --save ""
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ─── ClickHouse ───────────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.5
+    hostname: clickhouse
+    networks: [pulse]
+    ports:
+      - "9000:9000"
+      - "8123:8123"  # HTTP interface
+    environment:
+      CLICKHOUSE_DB: pulse
+      CLICKHOUSE_USER: pulse
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./migrations/clickhouse:/docker-entrypoint-initdb.d:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── PostgreSQL ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    hostname: postgres
+    networks: [pulse]
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: pulse
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: pulse
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./migrations/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulse"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ─── MongoDB ─────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7.0
+    hostname: mongo
+    networks: [pulse]
+    ports:
+      - "27018:27017"
+    environment:
+      MONGO_INITDB_DATABASE: pulse
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── OpenTelemetry Collector ──────────────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.102.0
+    hostname: otel-collector
+    networks: [pulse]
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus metrics
+    volumes:
+      - ./configs/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    command: ["--config=/etc/otelcol/config.yaml"]
+
+  # ─── Prometheus ───────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    hostname: prometheus
+    networks: [pulse]
+    ports:
+      - "9093:9090"
+    volumes:
+      - ./configs/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+
+  # ─── Grafana ─────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.0.0
+    hostname: grafana
+    depends_on: [prometheus]
+    networks: [pulse]
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: pulse
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./configs/grafana-provisioning:/etc/grafana/provisioning:ro
+
+  # ─── Jaeger ───────────────────────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    hostname: jaeger
+    networks: [pulse]
+    ports:
+      - "16686:16686"  # UI
+      - "14250:14250"  # gRPC
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  # ─── PulseAnalytics Services ──────────────────────────────────────────────
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    hostname: gateway
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks: [pulse]
+    ports:
+      - "8080:8080"
+      - "9089:9089"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+      PULSE_AUTH_JWTSECRET: dev-secret-change-in-production-32chars
+      PULSE_KAFKA_BROKERS: kafka:9092
+      PULSE_REDIS_ADDRS: redis:6379
+      PULSE_POSTGRES_DSN: postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable
+      PULSE_MONGO_URI: mongodb://mongo:27017
+      PULSE_TELEMETRY_OTLPENDPOINT: otel-collector:4317
+    restart: unless-stopped
+
+  auth:
+    build:
+      context: .
+      dockerfile: auth/Dockerfile
+    hostname: auth
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [pulse]
+    ports:
+      - "8081:8081"
+      - "9088:9088"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+      PULSE_HTTP_PORT: 8081
+      PULSE_AUTH_JWTSECRET: dev-secret-change-in-production-32chars
+      PULSE_POSTGRES_DSN: postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable
+      PULSE_REDIS_ADDRS: redis:6379
+      PULSE_TELEMETRY_OTLPENDPOINT: otel-collector:4317
+    restart: unless-stopped
+
+  enricher:
+    build:
+      context: .
+      dockerfile: enricher/Dockerfile
+    hostname: enricher
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [pulse]
+    ports:
+      - "8082:8082"
+      - "9091:9091"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+      PULSE_HTTP_PORT: 8082
+      PULSE_KAFKA_BROKERS: kafka:9092
+      PULSE_REDIS_ADDRS: redis:6379
+      PULSE_TELEMETRY_OTLPENDPOINT: otel-collector:4317
+    restart: unless-stopped
+
+  session:
+    build:
+      context: .
+      dockerfile: session/Dockerfile
+    hostname: session
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [pulse]
+    ports:
+      - "8083:8083"
+      - "9092:9092"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+      PULSE_HTTP_PORT: 8083
+      PULSE_KAFKA_BROKERS: kafka:9092
+      PULSE_REDIS_ADDRS: redis:6379
+      PULSE_TELEMETRY_OTLPENDPOINT: otel-collector:4317
+    restart: unless-stopped
+
+  funnel:
+    build:
+      context: .
+      dockerfile: funnel/Dockerfile
+    hostname: funnel
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks: [pulse]
+    ports:
+      - "8084:8084"
+      - "9099:9093"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+      PULSE_HTTP_PORT: 8084
+      PULSE_KAFKA_BROKERS: kafka:9092
+      PULSE_REDIS_ADDRS: redis:6379
+      PULSE_POSTGRES_DSN: postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable
+      PULSE_TELEMETRY_OTLPENDPOINT: otel-collector:4317
+    restart: unless-stopped
+
+  chwriter:
+    build:
+      context: .
+      dockerfile: chwriter/Dockerfile
+    hostname: chwriter
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks: [pulse]
+    ports:
+      - "8088:8088"
+      - "9097:9097"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+      PULSE_HTTP_PORT: 8088
+      PULSE_KAFKA_BROKERS: kafka:9092
+      PULSE_CLICKHOUSE_HOSTS: clickhouse:9000
+      PULSE_TELEMETRY_OTLPENDPOINT: otel-collector:4317
+    restart: unless-stopped
+
+  query-api:
+    build:
+      context: .
+      dockerfile: query-api/Dockerfile
+    hostname: query-api
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks: [pulse]
+    ports:
+      - "8085:8085"
+      - "9098:9094"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+      PULSE_AUTH_JWTSECRET: dev-secret-change-in-production-32chars
+      PULSE_CLICKHOUSE_HOSTS: clickhouse:9000
+      PULSE_REDIS_ADDRS: redis:6379
+      PULSE_POSTGRES_DSN: postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable
+      PULSE_TELEMETRY_OTLPENDPOINT: otel-collector:4317
+    restart: unless-stopped
+
+  alert-engine:
+    build:
+      context: .
+      dockerfile: alert-engine/Dockerfile
+    hostname: alert-engine
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks: [pulse]
+    ports:
+      - "8086:8086"
+      - "9095:9095"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+      PULSE_KAFKA_BROKERS: kafka:9092
+      PULSE_CLICKHOUSE_HOSTS: clickhouse:9000
+      PULSE_POSTGRES_DSN: postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable
+      PULSE_TELEMETRY_OTLPENDPOINT: otel-collector:4317
+    restart: unless-stopped
+
+  notification:
+    build:
+      context: .
+      dockerfile: notification/Dockerfile
+    hostname: notification
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    networks: [pulse]
+    ports:
+      - "8087:8087"
+      - "9096:9096"
+    environment:
+      CONFIG_PATH: /configs/config.yaml
+      PULSE_HTTP_PORT: 8087
+      PULSE_KAFKA_BROKERS: kafka:9092
+      PULSE_POSTGRES_DSN: postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable
+      PULSE_MONGO_URI: mongodb://mongo:27017
+      PULSE_TELEMETRY_OTLPENDPOINT: otel-collector:4317
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    hostname: frontend
+    depends_on:
+      - gateway
+    networks: [pulse]
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+
+  # ─── Swagger UI — aggregated API docs for all services ────────────────────
+  swagger-ui:
+    image: swaggerapi/swagger-ui:v5.17.14
+    hostname: swagger-ui
+    networks: [pulse]
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./configs/swagger-specs:/specs:ro
+    environment:
+      URLS: >-
+        [
+          {"url":"/specs/gateway.yaml","name":"Gateway (Ingest)"},
+          {"url":"/specs/auth.yaml","name":"Auth"},
+          {"url":"/specs/query-api.yaml","name":"Query API"},
+          {"url":"/specs/alert-engine.yaml","name":"Alert Engine"},
+          {"url":"/specs/notification.yaml","name":"Notification"},
+          {"url":"/specs/enricher.yaml","name":"Enricher"},
+          {"url":"/specs/session.yaml","name":"Session"},
+          {"url":"/specs/funnel.yaml","name":"Funnel"},
+          {"url":"/specs/chwriter.yaml","name":"CH Writer"}
+        ]
+      URLS_PRIMARY_NAME: "Gateway (Ingest)"
+      BASE_URL: /
+    restart: unless-stopped
