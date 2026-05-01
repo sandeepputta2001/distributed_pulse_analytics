@@ -12,6 +12,9 @@ A production-grade, high-throughput analytics platform inspired by Amplitude and
 - [Technology Stack](#technology-stack)
 - [Project Structure](#project-structure)
 - [Quick Start (Local)](#quick-start-local)
+- [Running on Minikube](#running-on-minikube)
+- [Observability — LGTM Stack](#observability--lgtm-stack)
+- [Load Testing with Locust](#load-testing-with-locust)
 - [Running Services Individually](#running-services-individually)
 - [Authentication](#authentication)
 - [API Reference](#api-reference)
@@ -1080,6 +1083,210 @@ window.addEventListener('beforeunload', () => pulse.flush());
 
 ---
 
+## Running on Minikube
+
+Run the entire PulseAnalytics stack locally on Minikube — all 9 services, full LGTM observability, and Locust load testing.
+
+### Prerequisites
+
+| Tool | Version | Install |
+|------|---------|---------|
+| minikube | ≥ 1.33 | https://minikube.sigs.k8s.io/docs/start/ |
+| kubectl | ≥ 1.28 | https://kubernetes.io/docs/tasks/tools/ |
+| docker | ≥ 24 | https://docs.docker.com/get-docker/ |
+| helm | ≥ 3.14 | https://helm.sh/docs/intro/install/ |
+| python3 + pip | ≥ 3.10 | (for local Locust) |
+
+**Recommended Minikube resources:** 4 CPUs, 8 GB RAM, 40 GB disk.
+
+### One-command deploy
+
+```bash
+make minikube-deploy
+```
+
+This runs the full sequence: start Minikube → build images → install Strimzi → deploy infra → deploy LGTM stack → deploy services → deploy Locust.
+
+### Step-by-step
+
+```bash
+# 1. Start Minikube
+make minikube-start
+
+# 2. Build all service images into Minikube's Docker daemon (no registry needed)
+make minikube-build
+
+# 3. Install Strimzi Kafka Operator
+make minikube-install-strimzi
+
+# 4. Deploy infrastructure (Redis, ClickHouse, Postgres, Mongo, Kafka)
+make minikube-deploy-infra
+
+# 5. Deploy LGTM observability stack
+make minikube-deploy-monitoring
+
+# 6. Deploy application services
+make minikube-deploy-services
+
+# 7. Deploy Locust load test
+make minikube-deploy-loadtest
+
+# 8. Print all access URLs
+make minikube-urls
+```
+
+### Accessing services
+
+After deploy, add to `/etc/hosts`:
+
+```
+$(minikube ip)  pulse.local api.pulse.local grafana.pulse.local
+```
+
+| Service | URL | Notes |
+|---------|-----|-------|
+| Gateway (ingest) | `http://pulse.local` | or NodePort via `minikube service gateway -n pulse` |
+| Query API | `http://api.pulse.local` | or NodePort via `minikube service query-api -n pulse` |
+| Grafana | `http://grafana.pulse.local` | admin / pulse-admin |
+| Locust UI | `minikube service locust-master -n loadtest` | load test control |
+| Prometheus | `kubectl port-forward svc/prometheus 9090:9090 -n monitoring` | |
+| Mimir | `kubectl port-forward svc/mimir 9009:9009 -n monitoring` | |
+| Loki | `kubectl port-forward svc/loki 3100:3100 -n monitoring` | |
+| Tempo | `kubectl port-forward svc/tempo 3200:3200 -n monitoring` | |
+
+### Useful commands
+
+```bash
+make minikube-status    # pod status across all namespaces
+make minikube-logs      # tail all service logs
+make minikube-grafana   # open Grafana in browser
+make minikube-locust    # open Locust UI in browser
+make minikube-stop      # stop Minikube (preserves state)
+make minikube-delete    # delete cluster entirely
+```
+
+---
+
+## Observability — LGTM Stack
+
+PulseAnalytics ships a full **Grafana LGTM** (Loki + Grafana + Tempo + Mimir) stack with OpenTelemetry as the unified collection layer.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         TELEMETRY PIPELINE                                   │
+│                                                                              │
+│  All Services                                                                │
+│  (OTLP gRPC :4317)  ──►  OpenTelemetry Collector                            │
+│                               │                                              │
+│                    ┌──────────┼──────────────┐                               │
+│                    ▼          ▼              ▼                               │
+│                 Tempo       Mimir           Loki                             │
+│               (traces)    (metrics)        (logs)                            │
+│                    └──────────┼──────────────┘                               │
+│                               ▼                                              │
+│                            Grafana                                           │
+│                    (unified dashboards :3000)                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Components
+
+| Component | Role | Port |
+|-----------|------|------|
+| **OpenTelemetry Collector** | Receives OTLP traces/metrics/logs; routes to backends | 4317 (gRPC), 4318 (HTTP) |
+| **Grafana Tempo** | Distributed tracing backend (replaces Jaeger) | 3200 |
+| **Grafana Mimir** | Long-term metrics storage (Prometheus-compatible) | 9009 |
+| **Grafana Loki** | Log aggregation (structured JSON logs from all pods) | 3100 |
+| **Prometheus** | Short-term scrape + remote_write to Mimir | 9090 |
+| **Grafana** | Unified UI: dashboards, trace explorer, log viewer | 3000 |
+
+### OTel Collector pipeline
+
+```
+Receivers:   otlp (gRPC/HTTP), filelog (pod logs), prometheus (self-scrape)
+Processors:  memory_limiter → k8sattributes → resource → batch → tail_sampling
+Exporters:
+  traces  → Tempo  (otlp/grpc)
+  metrics → Mimir  (prometheusremotewrite) + Prometheus scrape endpoint (:8889)
+  logs    → Loki   (loki exporter)
+```
+
+Tail-based sampling policy:
+- **100%** of error traces
+- **100%** of traces with latency > 200ms
+- **10%** probabilistic sampling for the rest
+
+### Pre-built Grafana dashboards
+
+| Dashboard | UID | Description |
+|-----------|-----|-------------|
+| Ingest Gateway | `pulse-ingest` | Events/sec, error rate, P95 latency, Kafka lag, logs, traces |
+| Query API | `pulse-queryapi` | Request rate, latency percentiles, cache hit rate, CH insert rate, logs |
+| Infrastructure | `pulse-infra` | Kafka lag by topic, Redis memory, ClickHouse queries, pod CPU/memory |
+| SLO Tracking | `pulse-slo` | Ingest availability, query P95 SLO, error budget |
+| Sessions & Funnels | `pulse-sessions` | Session rate, duration percentiles, logs |
+| Load Test | `pulse-loadtest` | Locust RPS, failures, response time, active users |
+
+### Trace correlation
+
+Grafana is configured with full trace-to-log and trace-to-metric correlation:
+- Click a trace in Tempo → jump to matching Loki logs for that pod/namespace
+- Click a span → see related Mimir metrics for that service
+- Service map auto-generated from Tempo span metrics
+
+---
+
+## Load Testing with Locust
+
+### Run inside the cluster (recommended)
+
+Locust runs in distributed mode (1 master + 2 workers) inside the `loadtest` namespace, targeting the gateway service directly via ClusterIP DNS.
+
+```bash
+# Deploy Locust
+make minikube-deploy-loadtest
+
+# Open Locust web UI
+make minikube-locust
+
+# In the UI: set number of users (e.g. 50) and spawn rate (e.g. 5), click Start
+```
+
+### Run locally against Minikube
+
+```bash
+# Install Locust
+make loadtest-install
+
+# Interactive web UI
+make loadtest-run
+
+# Headless 5-minute test (50 users)
+make loadtest-headless
+```
+
+### Load test scenarios
+
+The `loadtest/locustfile.py` simulates two user types:
+
+**SDKUser (80% weight)** — event ingestion:
+- Small batches (1–10 events): 70% of requests
+- Medium batches (25–100 events): 20% of requests
+- Large batches (200–500 events): 5% of requests
+- Health checks: 5%
+
+**DashboardUser (20% weight)** — analytics queries:
+- Event count queries: 40%
+- Active users queries: 30%
+- Retention queries: 20%
+- Health checks: 10%
+
+### Viewing results in Grafana
+
+Open the **Load Test (Locust)** dashboard in Grafana to see Locust metrics (RPS, failures, response time, active users) alongside the gateway's real-time event throughput — all in one view.
+
+---
+
 ## Kubernetes Deployment
 
 ### Cluster Topology (GKE)
@@ -1197,7 +1404,29 @@ GitHub Push / PR
 ## Makefile Reference
 
 ```
-Infrastructure:
+Minikube (full local cluster):
+  make minikube-deploy            Full deploy: start + build + all services + LGTM + Locust
+  make minikube-start             Start Minikube (4 CPU, 8GB RAM, docker driver)
+  make minikube-build             Build all images into Minikube Docker daemon
+  make minikube-install-strimzi   Install Strimzi Kafka Operator
+  make minikube-deploy-infra      Deploy Redis/ClickHouse/Postgres/Mongo/Kafka
+  make minikube-deploy-monitoring Deploy LGTM stack (Loki+Grafana+Tempo+Mimir+OTel+Prometheus)
+  make minikube-deploy-services   Deploy all 9 application services
+  make minikube-deploy-loadtest   Deploy Locust load test (master + 2 workers)
+  make minikube-status            Show pod status across all namespaces
+  make minikube-urls              Print all service access URLs
+  make minikube-grafana           Open Grafana in browser
+  make minikube-locust            Open Locust UI in browser
+  make minikube-logs              Tail all service logs
+  make minikube-stop              Stop Minikube (preserves state)
+  make minikube-delete            Delete Minikube cluster entirely
+
+Load Testing (local Locust):
+  make loadtest-install           pip install locust
+  make loadtest-run               Start Locust web UI (http://localhost:8089)
+  make loadtest-headless          Run 50-user headless test for 5 min → loadtest/report.html
+
+Infrastructure (local docker-compose):
   make infra-up           Start Kafka, Redis, ClickHouse, Postgres, Mongo, Observability
   make infra-down         Stop all infrastructure containers
   make migrate-all        Run all DB migrations (Postgres + ClickHouse + Mongo)

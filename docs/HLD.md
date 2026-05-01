@@ -18,6 +18,9 @@
 10. [Consistency, Availability & Latency Model](#10-consistency-availability--latency-model)
 11. [Bottlenecks & Mitigations](#11-bottlenecks--mitigations)
 12. [Cost vs Performance](#12-cost-vs-performance)
+13. [Observability Architecture — LGTM Stack](#13-observability-architecture--lgtm-stack)
+14. [Local Development — Minikube](#14-local-development--minikube)
+15. [Load Testing Strategy](#15-load-testing-strategy)
 
 ---
 
@@ -221,7 +224,8 @@ Total cluster network requirement: ~10 Gbps backbone
               │                   SHARED INFRASTRUCTURE                           │
               │   PostgreSQL (Aurora HA)   Redis Cluster   MongoDB Atlas          │
               │   Kafka (MSK, 3 brokers)   Auth Service    Prometheus + Grafana   │
-              │   OpenTelemetry Collector  Jaeger          MaxMind GeoIP DB        │
+              │   OpenTelemetry Collector  Tempo (traces)  Loki (logs)            │
+              │   Mimir (metrics)          MaxMind GeoIP DB                       │
               └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -774,4 +778,291 @@ PulseAnalytics makes **different CAP choices per tier**:
 
 ---
 
-*Document version: 1.1 | Architecture owner: Platform Engineering | Last updated: 2026-04-17*
+*Document version: 1.2 | Architecture owner: Platform Engineering | Last updated: 2026-05-01*
+
+---
+
+## 13. Observability Architecture — LGTM Stack
+
+PulseAnalytics uses the **Grafana LGTM** stack (Loki + Grafana + Tempo + Mimir) with OpenTelemetry as the unified collection layer. This replaces the previous Jaeger-only tracing setup with a fully integrated signals platform.
+
+### 13.1 Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         TELEMETRY PIPELINE                                   │
+│                                                                              │
+│  All Services (Go)                                                           │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  OTLP SDK (go.opentelemetry.io/otel)                                 │   │
+│  │  • Traces  → OTLP gRPC :4317                                         │   │
+│  │  • Metrics → OTLP gRPC :4317                                         │   │
+│  │  • Logs    → structured JSON to stdout (collected by filelog)        │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                            │
+│                                 ▼                                            │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  OpenTelemetry Collector (contrib)                                   │   │
+│  │                                                                      │   │
+│  │  Receivers:   otlp (gRPC/HTTP), filelog (pod logs), prometheus       │   │
+│  │  Processors:  memory_limiter → k8sattributes → resource →            │   │
+│  │               batch → tail_sampling                                  │   │
+│  │  Exporters:                                                          │   │
+│  │    traces  → Tempo  (otlp/grpc)                                      │   │
+│  │    metrics → Mimir  (prometheusremotewrite) + :8889 (scrape)         │   │
+│  │    logs    → Loki   (loki exporter)                                  │   │
+│  └──────────┬──────────────────┬──────────────────┬───────────────────-┘   │
+│             │                  │                  │                          │
+│             ▼                  ▼                  ▼                          │
+│  ┌──────────────┐   ┌──────────────────┐   ┌──────────────┐                │
+│  │ Grafana Tempo │   │  Grafana Mimir   │   │ Grafana Loki │                │
+│  │  (traces)    │   │  (metrics)       │   │  (logs)      │                │
+│  │  :3200       │   │  :9009           │   │  :3100       │                │
+│  └──────┬───────┘   └────────┬─────────┘   └──────┬───────┘                │
+│         │                    │                     │                         │
+│         └────────────────────┼─────────────────────┘                        │
+│                              ▼                                               │
+│                   ┌──────────────────────┐                                  │
+│                   │      Grafana         │                                   │
+│                   │  (unified UI :3000)  │                                   │
+│                   │  Dashboards, Alerts, │                                   │
+│                   │  Trace Explorer,     │                                   │
+│                   │  Log Viewer          │                                   │
+│                   └──────────────────────┘                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 13.2 Component Roles
+
+| Component | Role | Port | Retention |
+|-----------|------|------|-----------|
+| **OTel Collector** | Unified receiver, processor, router for all signals | 4317 (gRPC), 4318 (HTTP) | — |
+| **Grafana Tempo** | Distributed trace storage and query backend | 3200 | 24h (dev), configurable |
+| **Grafana Mimir** | Long-term Prometheus-compatible metrics storage | 9009 | Unlimited (object storage) |
+| **Grafana Loki** | Log aggregation, indexed by labels | 3100 | 7 days (dev), configurable |
+| **Prometheus** | Short-term scrape + remote_write to Mimir | 9090 | 6h local (dev) |
+| **Grafana** | Unified dashboards, trace/log/metric correlation | 3000 | — |
+
+### 13.3 OTel Collector Pipeline Design
+
+**Tail-based sampling policy** (applied to traces):
+- **100%** of traces containing an error span
+- **100%** of traces with any span latency > 200ms
+- **10%** probabilistic sampling for all other traces
+
+This ensures full visibility into failures and SLO breaches while keeping storage costs manageable.
+
+**k8sattributes processor** enriches every span/metric/log with:
+- `k8s.pod.name`, `k8s.namespace.name`, `k8s.deployment.name`, `k8s.node.name`
+- `app` and `component` labels from pod metadata
+
+### 13.4 Trace Correlation in Grafana
+
+Grafana is configured with full cross-signal correlation:
+
+| From | To | Mechanism |
+|------|----|-----------|
+| Trace span (Tempo) | Logs (Loki) | TraceID extracted from log JSON → Loki query `{namespace="pulse"} |= "{traceId}"` |
+| Trace span (Tempo) | Metrics (Mimir) | Span tags → Mimir query for `service` label |
+| Log line (Loki) | Trace (Tempo) | `trace_id` field in JSON log → Tempo trace link |
+| Metric panel (Mimir) | Traces (Tempo) | Exemplars on histograms carry trace IDs |
+
+### 13.5 Pre-built Dashboards
+
+| Dashboard | Signals Used | Key Panels |
+|-----------|-------------|------------|
+| **Ingest Gateway** | Metrics (Mimir) + Logs (Loki) + Traces (Tempo) | Events/sec, error rate, P95 latency, Kafka lag, live logs, trace explorer |
+| **Query API** | Metrics + Logs | Request rate, latency percentiles, cache hit rate, CH insert rate |
+| **Infrastructure** | Metrics | Kafka lag by topic, Redis memory, ClickHouse queries/sec, pod CPU/memory |
+| **SLO Tracking** | Metrics | Ingest availability (99.9% target), query P95 SLO (<200ms), error budget |
+| **Sessions & Funnels** | Metrics + Logs | Session rate, duration percentiles, session engine logs |
+| **Load Test** | Metrics | Locust RPS, failures, response time, active users, gateway throughput |
+
+### 13.6 Metrics Exposed per Service
+
+Every service exposes `/metrics` on port `9091` with these key metrics:
+
+| Metric | Type | Services |
+|--------|------|---------|
+| `pulse_ingest_events_total` | Counter | gateway |
+| `pulse_ingest_errors_total` | Counter | gateway |
+| `pulse_ingest_latency_seconds` | Histogram | gateway |
+| `pulse_ingest_duplicates_filtered_total` | Counter | gateway |
+| `pulse_consumer_lag` | Gauge | enricher, session, chwriter, funnel |
+| `pulse_clickhouse_inserted_total` | Counter | chwriter |
+| `pulse_clickhouse_query_latency_seconds` | Histogram | query-api |
+| `pulse_redis_cache_hits_total` | Counter | query-api, gateway |
+| `pulse_redis_cache_misses_total` | Counter | query-api, gateway |
+| `pulse_sessions_opened_total` | Counter | session |
+| `pulse_session_duration_seconds` | Histogram | session |
+| `pulse_query_requests_total` | Counter | query-api |
+| `pulse_alert_fired_total` | Counter | alert-engine |
+| `pulse_circuit_breaker_state` | Gauge | chwriter, query-api |
+
+---
+
+## 14. Local Development — Minikube
+
+### 14.1 Motivation
+
+The production deployment targets AWS EKS with managed services (MSK, ElastiCache, RDS, DocumentDB). For local development and integration testing, a Minikube-based environment replicates the full stack on a single machine using lightweight, single-replica versions of all dependencies.
+
+### 14.2 Minikube Stack Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         MINIKUBE CLUSTER                                     │
+│                                                                              │
+│  Namespace: pulse                    Namespace: monitoring                   │
+│  ┌─────────────────────────────┐    ┌──────────────────────────────────┐    │
+│  │  Application Services       │    │  LGTM Observability              │    │
+│  │  • gateway        (1 pod)   │    │  • otel-collector  (1 pod)       │    │
+│  │  • enricher       (1 pod)   │    │  • loki            (1 pod)       │    │
+│  │  • session        (1 pod)   │    │  • tempo           (1 pod)       │    │
+│  │  • funnel         (1 pod)   │    │  • mimir           (1 pod)       │    │
+│  │  • chwriter       (1 pod)   │    │  • prometheus      (1 pod)       │    │
+│  │  • query-api      (1 pod)   │    │  • grafana         (1 pod)       │    │
+│  │  • alertengine    (1 pod)   │    └──────────────────────────────────┘    │
+│  │  • auth-service   (1 pod)   │                                            │
+│  │  • notification   (1 pod)   │    Namespace: loadtest                     │
+│  ├─────────────────────────────┤    ┌──────────────────────────────────┐    │
+│  │  Infrastructure             │    │  Locust Load Test                │    │
+│  │  • kafka (Strimzi, 1 broker)│    │  • locust-master   (1 pod)       │    │
+│  │  • redis          (1 pod)   │    │  • locust-worker   (2 pods)      │    │
+│  │  • clickhouse     (1 pod)   │    └──────────────────────────────────┘    │
+│  │  • postgres       (1 pod)   │                                            │
+│  │  • mongo          (1 pod)   │                                            │
+│  └─────────────────────────────┘                                            │
+│                                                                              │
+│  Ingress (nginx):                                                            │
+│    pulse.local          → gateway:8080                                       │
+│    api.pulse.local      → query-api:8082                                     │
+│    grafana.pulse.local  → grafana:3000                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 14.3 Resource Requirements
+
+| Component | CPU Request | Memory Request | Notes |
+|-----------|------------|----------------|-------|
+| All app services (×9) | 50–100m each | 64–256Mi each | Reduced from production |
+| Kafka (Strimzi) | 250m | 512Mi | Single broker, ephemeral storage |
+| Redis | 100m | 128Mi | Standalone (no cluster) |
+| ClickHouse | 500m | 512Mi | Single node, emptyDir |
+| Postgres | 100m | 256Mi | Single node, emptyDir |
+| Mongo | 100m | 256Mi | Single node, emptyDir |
+| OTel Collector | 100m | 256Mi | — |
+| Loki | 100m | 256Mi | Single-binary, filesystem |
+| Tempo | 100m | 256Mi | Single-binary, emptyDir |
+| Mimir | 200m | 512Mi | Single-binary, emptyDir |
+| Prometheus | 200m | 512Mi | 6h retention |
+| Grafana | 100m | 256Mi | — |
+| Locust (master+2 workers) | 300m total | 384Mi total | — |
+| **Total** | **~3.5 CPU** | **~6 GB RAM** | Fits in 4 CPU / 8 GB Minikube |
+
+### 14.4 Key Differences from Production
+
+| Aspect | Production (EKS) | Minikube |
+|--------|-----------------|---------|
+| Kafka | Strimzi 3-broker, 500Gi persistent | Strimzi 1-broker, ephemeral |
+| Redis | 6-node cluster (3 primary + 3 replica) | Single standalone pod |
+| ClickHouse | 6 nodes (3 shards × 2 replicas) | Single node |
+| Postgres | Aurora Multi-AZ | Single pod, emptyDir |
+| MongoDB | Atlas M50 sharded | Single pod, emptyDir |
+| Service replicas | 1–20 per service | 1 per service |
+| Image pull | ECR registry | Local Minikube daemon (`imagePullPolicy: Never`) |
+| Secrets | AWS Secrets Manager | Plaintext k8s Secrets (dev values) |
+| Ingress | AWS ALB | nginx ingress addon |
+| Storage | EBS gp3 / EFS | emptyDir (ephemeral) |
+| Autoscaling | HPA + KEDA | Disabled |
+| Istio mTLS | Enabled | Disabled |
+
+### 14.5 Deploy Commands
+
+```bash
+# Full one-command deploy
+make minikube-deploy
+
+# Step-by-step
+make minikube-start              # Start Minikube (4 CPU, 8GB RAM)
+make minikube-build              # Build images into Minikube daemon
+make minikube-install-strimzi    # Install Strimzi Kafka Operator
+make minikube-deploy-infra       # Redis, ClickHouse, Postgres, Mongo, Kafka
+make minikube-deploy-monitoring  # LGTM stack
+make minikube-deploy-services    # All 9 application services
+make minikube-deploy-loadtest    # Locust load test
+
+# Operations
+make minikube-status             # Pod status across all namespaces
+make minikube-urls               # Print all access URLs
+make minikube-grafana            # Open Grafana in browser
+make minikube-locust             # Open Locust UI in browser
+make minikube-stop               # Stop (preserves state)
+make minikube-delete             # Delete cluster
+```
+
+---
+
+## 15. Load Testing Strategy
+
+### 15.1 Tool: Locust
+
+Locust is used for load testing because it is Python-based (easy to extend), supports distributed mode (master + workers), and exposes Prometheus metrics natively.
+
+### 15.2 Deployment Modes
+
+**In-cluster (recommended for CI/integration testing):**
+- Locust master + 2 workers run in the `loadtest` namespace.
+- Workers target `gateway.pulse.svc.cluster.local:8080` directly via ClusterIP DNS.
+- No network overhead from NodePort or ingress.
+- Access the web UI via `minikube service locust-master -n loadtest`.
+
+**Local (for interactive testing):**
+```bash
+make loadtest-install    # pip install locust==2.29.1
+make loadtest-run        # web UI at http://localhost:8089
+make loadtest-headless   # 50 users, 5 min, saves report to loadtest/report.html
+```
+
+### 15.3 User Profiles
+
+| User Type | Weight | Behaviour | Wait Time |
+|-----------|--------|-----------|-----------|
+| `SDKUser` | 80% | Sends event batches to `/v1/events` | 0.1–1.0s |
+| `DashboardUser` | 20% | Runs analytics queries against Query API | 1.0–5.0s |
+
+**SDKUser task distribution:**
+- 70% small batches (1–10 events) — typical SDK flush
+- 20% medium batches (25–100 events) — mobile background flush
+- 5% large batches (200–500 events) — server-side bulk ingest
+- 5% health checks
+
+**DashboardUser task distribution:**
+- 40% event count queries
+- 30% active users queries
+- 20% retention queries
+- 10% health checks
+
+### 15.4 Observability During Load Tests
+
+The **Load Test** Grafana dashboard (`pulse-loadtest`) shows:
+- Locust RPS and failure rate (from Prometheus metrics)
+- Locust average response time per endpoint
+- Active user count
+- Gateway events/sec and error rate (real-time impact on the system)
+
+This allows correlating load test parameters with system behaviour in a single view.
+
+### 15.5 Recommended Test Scenarios
+
+| Scenario | Users | Spawn Rate | Duration | Purpose |
+|----------|-------|-----------|----------|---------|
+| Smoke test | 5 | 1/s | 2 min | Verify all endpoints respond |
+| Baseline | 20 | 2/s | 5 min | Establish baseline metrics |
+| Load test | 50 | 5/s | 10 min | Normal expected load |
+| Stress test | 100 | 10/s | 10 min | Find breaking point |
+| Soak test | 30 | 3/s | 30 min | Detect memory leaks, drift |
+
+---
+
+*Document version: 1.2 | Architecture owner: Platform Engineering | Last updated: 2026-05-01*

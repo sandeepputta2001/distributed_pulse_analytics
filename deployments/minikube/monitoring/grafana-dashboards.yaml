@@ -1,0 +1,111 @@
+---
+# Grafana Dashboards ConfigMap — LGTM integrated (Mimir + Loki + Tempo)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulse-grafana-dashboards
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  pulse-ingest.json: |
+    {
+      "title": "Pulse - Ingest Gateway",
+      "uid": "pulse-ingest",
+      "tags": ["pulse","ingest"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "30s",
+      "panels": [
+        {"id":1,"title":"Events/sec","type":"stat","gridPos":{"h":4,"w":6,"x":0,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"rate(pulse_ingest_events_total[1m])","legendFormat":"events/sec"}]},
+        {"id":2,"title":"Error Rate","type":"stat","gridPos":{"h":4,"w":6,"x":6,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"rate(pulse_ingest_errors_total[5m]) / rate(pulse_ingest_requests_total[5m])","legendFormat":"error %"}]},
+        {"id":3,"title":"P95 Latency","type":"stat","gridPos":{"h":4,"w":6,"x":12,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"histogram_quantile(0.95, rate(pulse_ingest_latency_seconds_bucket[5m]))","legendFormat":"p95"}]},
+        {"id":4,"title":"Kafka Lag","type":"stat","gridPos":{"h":4,"w":6,"x":18,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"sum(pulse_consumer_lag)","legendFormat":"total lag"}]},
+        {"id":5,"title":"Ingest Throughput","type":"timeseries","gridPos":{"h":8,"w":24,"x":0,"y":4},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"rate(pulse_ingest_events_total[1m])","legendFormat":"events/sec"},{"expr":"rate(pulse_ingest_errors_total[1m])","legendFormat":"errors/sec"}]},
+        {"id":6,"title":"Gateway Logs","type":"logs","gridPos":{"h":8,"w":24,"x":0,"y":12},"datasource":{"type":"loki","uid":"loki"},"targets":[{"expr":"{namespace=\"pulse\",container=\"gateway\"} | json","legendFormat":""}],"options":{"showTime":true,"sortOrder":"Descending"}},
+        {"id":7,"title":"Gateway Traces","type":"traces","gridPos":{"h":8,"w":24,"x":0,"y":20},"datasource":{"type":"tempo","uid":"tempo"},"targets":[{"queryType":"traceql","query":"{resource.service.name=\"gateway\"}","legendFormat":""}]}
+      ]
+    }
+
+  pulse-queryapi.json: |
+    {
+      "title": "Pulse - Query API",
+      "uid": "pulse-queryapi",
+      "tags": ["pulse","query"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "60s",
+      "panels": [
+        {"id":1,"title":"Requests/sec","type":"stat","gridPos":{"h":4,"w":6,"x":0,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"rate(pulse_query_requests_total[1m])","legendFormat":"req/sec"}]},
+        {"id":2,"title":"P95 Latency","type":"stat","gridPos":{"h":4,"w":6,"x":6,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"histogram_quantile(0.95, rate(pulse_clickhouse_query_latency_seconds_bucket[5m]))","legendFormat":"p95"}]},
+        {"id":3,"title":"Cache Hit Rate","type":"stat","gridPos":{"h":4,"w":6,"x":12,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"rate(pulse_redis_cache_hits_total[5m]) / (rate(pulse_redis_cache_hits_total[5m]) + rate(pulse_redis_cache_misses_total[5m]))","legendFormat":"hit %"}]},
+        {"id":4,"title":"CH Insert Rate","type":"stat","gridPos":{"h":4,"w":6,"x":18,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"rate(pulse_clickhouse_inserted_total[1m])","legendFormat":"rows/sec"}]},
+        {"id":5,"title":"Query Latency Percentiles","type":"timeseries","gridPos":{"h":10,"w":24,"x":0,"y":4},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"histogram_quantile(0.50, rate(pulse_clickhouse_query_latency_seconds_bucket[5m]))","legendFormat":"p50"},{"expr":"histogram_quantile(0.95, rate(pulse_clickhouse_query_latency_seconds_bucket[5m]))","legendFormat":"p95"},{"expr":"histogram_quantile(0.99, rate(pulse_clickhouse_query_latency_seconds_bucket[5m]))","legendFormat":"p99"}]},
+        {"id":6,"title":"Query API Logs","type":"logs","gridPos":{"h":8,"w":24,"x":0,"y":14},"datasource":{"type":"loki","uid":"loki"},"targets":[{"expr":"{namespace=\"pulse\",container=\"query-api\"} | json","legendFormat":""}]}
+      ]
+    }
+
+  pulse-infra.json: |
+    {
+      "title": "Pulse - Infrastructure",
+      "uid": "pulse-infra",
+      "tags": ["pulse","infra"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "30s",
+      "panels": [
+        {"id":1,"title":"Kafka Consumer Lag by Topic","type":"timeseries","gridPos":{"h":8,"w":12,"x":0,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"pulse_consumer_lag","legendFormat":"{{topic}} / {{consumer_group}}"}]},
+        {"id":2,"title":"Redis Memory","type":"timeseries","gridPos":{"h":8,"w":12,"x":12,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"redis_memory_used_bytes","legendFormat":"used"},{"expr":"redis_memory_max_bytes","legendFormat":"max"}]},
+        {"id":3,"title":"ClickHouse Queries/sec","type":"timeseries","gridPos":{"h":8,"w":12,"x":0,"y":8},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"rate(ClickHouseProfileEvents_Query[1m])","legendFormat":"queries/sec"}]},
+        {"id":4,"title":"Pod CPU (pulse ns)","type":"timeseries","gridPos":{"h":8,"w":12,"x":12,"y":8},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"rate(container_cpu_usage_seconds_total{namespace=\"pulse\"}[1m])","legendFormat":"{{pod}}"}]},
+        {"id":5,"title":"Pod Memory (pulse ns)","type":"timeseries","gridPos":{"h":8,"w":24,"x":0,"y":16},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"container_memory_working_set_bytes{namespace=\"pulse\"}","legendFormat":"{{pod}}"}]}
+      ]
+    }
+
+  pulse-slo.json: |
+    {
+      "title": "Pulse - SLO Tracking",
+      "uid": "pulse-slo",
+      "tags": ["pulse","slo"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "5m",
+      "panels": [
+        {"id":1,"title":"Ingest Availability (target 99.9%)","type":"gauge","gridPos":{"h":6,"w":8,"x":0,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"100 * (1 - rate(pulse_ingest_errors_total[1h]) / rate(pulse_ingest_requests_total[1h]))","legendFormat":"availability %"}]},
+        {"id":2,"title":"Query P95 SLO (<200ms)","type":"gauge","gridPos":{"h":6,"w":8,"x":8,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"100 * rate(pulse_clickhouse_query_latency_seconds_bucket{le=\"0.2\"}[1h]) / rate(pulse_clickhouse_query_latency_seconds_count[1h])","legendFormat":"% < 200ms"}]},
+        {"id":3,"title":"Kafka Lag (all groups)","type":"timeseries","gridPos":{"h":8,"w":24,"x":0,"y":6},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"pulse_consumer_lag","legendFormat":"{{topic}} / {{consumer_group}}"}]}
+      ]
+    }
+
+  pulse-sessions.json: |
+    {
+      "title": "Pulse - Sessions and Funnels",
+      "uid": "pulse-sessions",
+      "tags": ["pulse","sessions"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "60s",
+      "panels": [
+        {"id":1,"title":"Sessions/min","type":"stat","gridPos":{"h":4,"w":6,"x":0,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"rate(pulse_sessions_opened_total[1m]) * 60","legendFormat":"sessions/min"}]},
+        {"id":2,"title":"Median Session Duration","type":"stat","gridPos":{"h":4,"w":6,"x":6,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"histogram_quantile(0.5, rate(pulse_session_duration_seconds_bucket[10m]))","legendFormat":"p50 duration"}]},
+        {"id":3,"title":"Session Duration Percentiles","type":"timeseries","gridPos":{"h":10,"w":24,"x":0,"y":4},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"histogram_quantile(0.50, rate(pulse_session_duration_seconds_bucket[5m]))","legendFormat":"p50"},{"expr":"histogram_quantile(0.95, rate(pulse_session_duration_seconds_bucket[5m]))","legendFormat":"p95"},{"expr":"histogram_quantile(0.99, rate(pulse_session_duration_seconds_bucket[5m]))","legendFormat":"p99"}]},
+        {"id":4,"title":"Session Engine Logs","type":"logs","gridPos":{"h":8,"w":24,"x":0,"y":14},"datasource":{"type":"loki","uid":"loki"},"targets":[{"expr":"{namespace=\"pulse\",container=\"session\"} | json","legendFormat":""}]}
+      ]
+    }
+
+  pulse-loadtest.json: |
+    {
+      "title": "Pulse - Load Test (Locust)",
+      "uid": "pulse-loadtest",
+      "tags": ["pulse","loadtest"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "10s",
+      "panels": [
+        {"id":1,"title":"Locust RPS","type":"timeseries","gridPos":{"h":8,"w":12,"x":0,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"locust_requests_current_rps","legendFormat":"{{name}} rps"}]},
+        {"id":2,"title":"Locust Failures/sec","type":"timeseries","gridPos":{"h":8,"w":12,"x":12,"y":0},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"locust_requests_current_fail_per_sec","legendFormat":"{{name}} fail/sec"}]},
+        {"id":3,"title":"Locust Avg Response Time","type":"timeseries","gridPos":{"h":8,"w":12,"x":0,"y":8},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"locust_requests_avg_response_time","legendFormat":"{{name}} avg ms"}]},
+        {"id":4,"title":"Active Users","type":"stat","gridPos":{"h":4,"w":6,"x":12,"y":8},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"locust_users","legendFormat":"users"}]},
+        {"id":5,"title":"Gateway Events/sec during load","type":"timeseries","gridPos":{"h":8,"w":24,"x":0,"y":16},"datasource":{"type":"prometheus","uid":"mimir"},"targets":[{"expr":"rate(pulse_ingest_events_total[30s])","legendFormat":"events/sec"},{"expr":"rate(pulse_ingest_errors_total[30s])","legendFormat":"errors/sec"}]}
+      ]
+    }

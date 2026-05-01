@@ -1,0 +1,95 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: pulse
+  labels:
+    app: notification-service
+    component: engagement
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-service
+  template:
+    metadata:
+      labels:
+        app: notification-service
+        component: engagement
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: notification-service
+          image: pulse-notificationservice:dev
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8084
+            - name: metrics
+              containerPort: 9091
+          env:
+            - name: CONFIG_PATH
+              value: /app/configs/notification.yaml
+            - name: PULSE_SERVICE_ENVIRONMENT
+              value: development
+            - name: PULSE_KAFKA_BROKERS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-kafka-secret
+                  key: brokers
+            - name: PULSE_REDIS_ADDRS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-redis-secret
+                  key: addrs
+            - name: PULSE_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-postgres-secret
+                  key: dsn
+            - name: PULSE_OTEL_ENDPOINT
+              value: "otel-collector.monitoring.svc.cluster.local:4317"
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: configs
+          configMap:
+            name: pulse-configs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  namespace: pulse
+  labels:
+    app: notification-service
+spec:
+  selector:
+    app: notification-service
+  ports:
+    - name: http
+      port: 8084
+      targetPort: 8084
+    - name: metrics
+      port: 9091
+      targetPort: 9091
+  type: ClusterIP

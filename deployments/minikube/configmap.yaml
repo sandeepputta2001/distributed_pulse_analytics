@@ -1,0 +1,365 @@
+---
+# ─── Pulse Analytics — Minikube ConfigMap ────────────────────────────────────
+# Overrides base configs for local Minikube environment.
+# Services read their config from /app/configs via CONFIG_PATH env var.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulse-configs
+  namespace: pulse
+data:
+  base.yaml: |
+    service:
+      environment: development
+      loglevel: info
+
+    http:
+      host: "0.0.0.0"
+      port: 8080
+      readtimeout: 10s
+      writetimeout: 30s
+      idletimeout: 60s
+      shutdowntimeout: 15s
+      maxbodybytes: 10485760
+
+    grpc:
+      host: "0.0.0.0"
+      port: 9090
+
+    kafka:
+      brokers:
+        - "pulse-kafka-kafka-bootstrap.pulse.svc.cluster.local:9092"
+      topicrawevents:  "raw-events"
+      topicenriched:   "enriched-events"
+      topicsession:    "session-events"
+      topicaggresults: "agg-results"
+      topicdlq:        "dlq-events"
+      topicnotify:     "notifications"
+      consumergroup:   "pulse-consumer"
+      producerbatch:   100
+      producerlinger:  5ms
+      acks:            "leader"
+      compression:     "snappy"
+      tls:             false
+
+    redis:
+      addrs:
+        - "redis-master.pulse.svc.cluster.local:6379"
+      password: ""
+      poolsize: 10
+      maxretries: 3
+      dialtimeout: 5s
+      readtimeout: 3s
+      writetimeout: 3s
+
+    clickhouse:
+      hosts:
+        - "clickhouse.pulse.svc.cluster.local:9000"
+      database: "pulse"
+      username: "pulse"
+      password: "pulse"
+      maxopenconn: 10
+      maxidleconn: 2
+      dialtimeout: 10s
+      tls: false
+      debug: false
+
+    postgres:
+      dsn: "postgres://pulse:pulse@postgres.pulse.svc.cluster.local:5432/pulse?sslmode=disable"
+      maxopenconn: 10
+      maxidleconn: 2
+      maxlifetime: 30m
+
+    mongo:
+      uri: "mongodb://mongo.pulse.svc.cluster.local:27017"
+      database: "pulse"
+      timeout: 10s
+
+    geoip:
+      dbpath: "/data/GeoLite2-City.mmdb"
+
+    auth:
+      jwtsecret: "dev-jwt-secret-change-me-in-production-64chars-padding-here"
+
+    telemetry:
+      endpoint: "otel-collector.monitoring.svc.cluster.local:4317"
+      samplerate: 1.0
+      insecure: true
+
+  gateway.yaml: |
+    service:
+      name: gateway
+      environment: development
+      loglevel: info
+
+    http:
+      host: "0.0.0.0"
+      port: 8080
+      readtimeout: 10s
+      writetimeout: 30s
+      idletimeout: 60s
+      shutdowntimeout: 15s
+      maxbodybytes: 5242880
+
+    kafka:
+      brokers:
+        - "pulse-kafka-kafka-bootstrap.pulse.svc.cluster.local:9092"
+      topicrawevents: "raw-events"
+      topicdlq: "dlq-events"
+      producerbatch: 100
+      producerlinger: 5ms
+      acks: "leader"
+      compression: "snappy"
+      tls: false
+
+    redis:
+      addrs:
+        - "redis-master.pulse.svc.cluster.local:6379"
+      password: ""
+      poolsize: 10
+      dialtimeout: 5s
+      readtimeout: 3s
+      writetimeout: 3s
+
+    postgres:
+      dsn: "postgres://pulse:pulse@postgres.pulse.svc.cluster.local:5432/pulse?sslmode=disable"
+      maxopenconn: 10
+      maxidleconn: 2
+
+    mongo:
+      uri: "mongodb://mongo.pulse.svc.cluster.local:27017"
+      database: "pulse"
+      timeout: 10s
+
+    geoip:
+      dbpath: "/data/GeoLite2-City.mmdb"
+
+    auth:
+      jwtsecret: "dev-jwt-secret-change-me-in-production-64chars-padding-here"
+
+    telemetry:
+      endpoint: "otel-collector.monitoring.svc.cluster.local:4317"
+      samplerate: 1.0
+      insecure: true
+
+    ingest:
+      maxbatchsize: 500
+      maxbodybytes: 5242880
+
+    ratelimit:
+      rps: 1000
+      burst: 2000
+
+  enricher.yaml: |
+    service:
+      name: enricher
+      environment: development
+      loglevel: info
+
+    kafka:
+      brokers:
+        - "pulse-kafka-kafka-bootstrap.pulse.svc.cluster.local:9092"
+      topicrawevents: "raw-events"
+      topicenriched: "enriched-events"
+      topicdlq: "dlq-events"
+      consumergroup: "enricher-group"
+      tls: false
+
+    redis:
+      addrs:
+        - "redis-master.pulse.svc.cluster.local:6379"
+      password: ""
+      poolsize: 10
+
+    geoip:
+      dbpath: "/data/GeoLite2-City.mmdb"
+
+    telemetry:
+      endpoint: "otel-collector.monitoring.svc.cluster.local:4317"
+      samplerate: 1.0
+      insecure: true
+
+  queryapi.yaml: |
+    service:
+      name: query-api
+      environment: development
+      loglevel: info
+
+    http:
+      host: "0.0.0.0"
+      port: 8082
+      readtimeout: 10s
+      writetimeout: 60s
+      idletimeout: 120s
+      shutdowntimeout: 15s
+
+    clickhouse:
+      hosts:
+        - "clickhouse.pulse.svc.cluster.local:9000"
+      database: "pulse"
+      username: "pulse"
+      password: "pulse"
+      maxopenconn: 10
+      maxidleconn: 2
+      dialtimeout: 10s
+      tls: false
+
+    redis:
+      addrs:
+        - "redis-master.pulse.svc.cluster.local:6379"
+      password: ""
+      poolsize: 10
+
+    postgres:
+      dsn: "postgres://pulse:pulse@postgres.pulse.svc.cluster.local:5432/pulse?sslmode=disable"
+      maxopenconn: 10
+      maxidleconn: 2
+
+    auth:
+      jwtsecret: "dev-jwt-secret-change-me-in-production-64chars-padding-here"
+
+    telemetry:
+      endpoint: "otel-collector.monitoring.svc.cluster.local:4317"
+      samplerate: 1.0
+      insecure: true
+
+    cache:
+      ttl: 300s
+
+  alertengine.yaml: |
+    service:
+      name: alert-engine
+      environment: development
+      loglevel: info
+
+    clickhouse:
+      hosts:
+        - "clickhouse.pulse.svc.cluster.local:9000"
+      database: "pulse"
+      username: "pulse"
+      password: "pulse"
+
+    redis:
+      addrs:
+        - "redis-master.pulse.svc.cluster.local:6379"
+      password: ""
+
+    postgres:
+      dsn: "postgres://pulse:pulse@postgres.pulse.svc.cluster.local:5432/pulse?sslmode=disable"
+
+    telemetry:
+      endpoint: "otel-collector.monitoring.svc.cluster.local:4317"
+      samplerate: 1.0
+      insecure: true
+
+  session.yaml: |
+    service:
+      name: session-engine
+      environment: development
+      loglevel: info
+
+    kafka:
+      brokers:
+        - "pulse-kafka-kafka-bootstrap.pulse.svc.cluster.local:9092"
+      topicenriched: "enriched-events"
+      topicsession: "session-events"
+      consumergroup: "session-engine-group"
+      tls: false
+
+    redis:
+      addrs:
+        - "redis-master.pulse.svc.cluster.local:6379"
+      password: ""
+      poolsize: 10
+
+    telemetry:
+      endpoint: "otel-collector.monitoring.svc.cluster.local:4317"
+      samplerate: 1.0
+      insecure: true
+
+  chwriter.yaml: |
+    service:
+      name: ch-writer
+      environment: development
+      loglevel: info
+
+    kafka:
+      brokers:
+        - "pulse-kafka-kafka-bootstrap.pulse.svc.cluster.local:9092"
+      topicsession: "session-events"
+      topicdlq: "dlq-events"
+      consumergroup: "ch-writer-group"
+      tls: false
+
+    clickhouse:
+      hosts:
+        - "clickhouse.pulse.svc.cluster.local:9000"
+      database: "pulse"
+      username: "pulse"
+      password: "pulse"
+      maxopenconn: 10
+      maxidleconn: 2
+
+    telemetry:
+      endpoint: "otel-collector.monitoring.svc.cluster.local:4317"
+      samplerate: 1.0
+      insecure: true
+
+  funnel.yaml: |
+    service:
+      name: funnel-processor
+      environment: development
+      loglevel: info
+
+    kafka:
+      brokers:
+        - "pulse-kafka-kafka-bootstrap.pulse.svc.cluster.local:9092"
+      topicsession: "session-events"
+      topicaggresults: "agg-results"
+      consumergroup: "funnel-group"
+      tls: false
+
+    redis:
+      addrs:
+        - "redis-master.pulse.svc.cluster.local:6379"
+      password: ""
+      poolsize: 10
+
+    postgres:
+      dsn: "postgres://pulse:pulse@postgres.pulse.svc.cluster.local:5432/pulse?sslmode=disable"
+
+    telemetry:
+      endpoint: "otel-collector.monitoring.svc.cluster.local:4317"
+      samplerate: 1.0
+      insecure: true
+
+  notification.yaml: |
+    service:
+      name: notification-service
+      environment: development
+      loglevel: info
+
+    http:
+      host: "0.0.0.0"
+      port: 8084
+
+    kafka:
+      brokers:
+        - "pulse-kafka-kafka-bootstrap.pulse.svc.cluster.local:9092"
+      topicnotify: "notifications"
+      consumergroup: "notification-group"
+      tls: false
+
+    redis:
+      addrs:
+        - "redis-master.pulse.svc.cluster.local:6379"
+      password: ""
+
+    postgres:
+      dsn: "postgres://pulse:pulse@postgres.pulse.svc.cluster.local:5432/pulse?sslmode=disable"
+
+    telemetry:
+      endpoint: "otel-collector.monitoring.svc.cluster.local:4317"
+      samplerate: 1.0
+      insecure: true

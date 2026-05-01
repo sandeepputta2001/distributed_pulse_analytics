@@ -1,0 +1,161 @@
+---
+# ─── Grafana Mimir — Minikube (single-binary mode) ───────────────────────────
+# Long-term metrics storage. Receives remote_write from OTel Collector and
+# Prometheus. Queried by Grafana as a Prometheus-compatible datasource.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mimir-config
+  namespace: monitoring
+data:
+  mimir.yaml: |
+    # Single-binary mode for Minikube
+    target: all
+
+    server:
+      http_listen_port: 9009
+      grpc_listen_port: 9095
+      log_level: warn
+
+    common:
+      storage:
+        backend: filesystem
+        filesystem:
+          dir: /data/mimir
+
+    blocks_storage:
+      backend: filesystem
+      filesystem:
+        dir: /data/mimir/blocks
+      tsdb:
+        dir: /data/mimir/tsdb
+
+    compactor:
+      data_dir: /data/mimir/compactor
+      sharding_ring:
+        kvstore:
+          store: memberlist
+
+    distributor:
+      ring:
+        instance_addr: 127.0.0.1
+        kvstore:
+          store: memberlist
+
+    ingester:
+      ring:
+        instance_addr: 127.0.0.1
+        kvstore:
+          store: memberlist
+        replication_factor: 1
+
+    ruler_storage:
+      backend: filesystem
+      filesystem:
+        dir: /data/mimir/rules
+
+    store_gateway:
+      sharding_ring:
+        replication_factor: 1
+
+    memberlist:
+      join_members: []
+
+    limits:
+      ingestion_rate: 30000
+      ingestion_burst_size: 50000
+      max_global_series_per_user: 1500000
+      out_of_order_time_window: 5m
+
+    usage_stats:
+      enabled: false
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mimir
+  namespace: monitoring
+  labels:
+    app: mimir
+    component: metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mimir
+  template:
+    metadata:
+      labels:
+        app: mimir
+        component: metrics
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9009"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: mimir
+          image: grafana/mimir:2.13.0
+          args:
+            - "-config.file=/etc/mimir/mimir.yaml"
+            - "-config.expand-env=true"
+          ports:
+            - name: http
+              containerPort: 9009
+            - name: grpc
+              containerPort: 9095
+          volumeMounts:
+            - name: mimir-config
+              mountPath: /etc/mimir
+              readOnly: true
+            - name: mimir-data
+              mountPath: /data/mimir
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - name: mimir-config
+          configMap:
+            name: mimir-config
+        - name: mimir-data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimir
+  namespace: monitoring
+  labels:
+    app: mimir
+spec:
+  selector:
+    app: mimir
+  ports:
+    - name: http
+      port: 9009
+      targetPort: 9009
+    - name: grpc
+      port: 9095
+      targetPort: 9095
+  type: ClusterIP

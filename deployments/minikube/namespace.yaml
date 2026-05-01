@@ -1,0 +1,16 @@
+---
+# ─── Namespaces for Minikube deployment ──────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pulse
+  labels:
+    app.kubernetes.io/part-of: pulse-analytics
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    app.kubernetes.io/part-of: pulse-analytics

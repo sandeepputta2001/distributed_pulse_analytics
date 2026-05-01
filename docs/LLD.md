@@ -24,9 +24,11 @@
 16. [Rate Limiting Design](#16-rate-limiting-design)
 17. [Caching Design](#17-caching-design)
 18. [Retry & Circuit Breaker Design](#18-retry--circuit-breaker-design)
-19. [Observability Design](#19-observability-design)
+19. [Observability Design — LGTM Stack](#19-observability-design--lgtm-stack)
 20. [Missing Data & Edge Cases](#20-missing-data--edge-cases)
 21. [Sharding & Replication — Detailed Design](#21-sharding--replication--detailed-design)
+22. [Minikube Deployment — Detailed Design](#22-minikube-deployment--detailed-design)
+23. [Load Testing — Detailed Design](#23-load-testing--detailed-design)
 
 ---
 
@@ -1537,89 +1539,265 @@ Implementation: per CH-Writer pod, per ClickHouse shard
 
 ---
 
-## 19. Observability Design
+## 19. Observability Design — LGTM Stack
 
-### 19.1 Metrics (Prometheus)
+The observability stack was upgraded from a Prometheus + Jaeger setup to the full **Grafana LGTM** (Loki + Grafana + Tempo + Mimir) stack with OpenTelemetry as the unified collection layer. All three signal types — traces, metrics, and logs — flow through a single OTel Collector pipeline.
+
+### 19.1 OpenTelemetry Collector Pipeline
+
+```yaml
+# Receivers
+receivers:
+  otlp:                          # All services push OTLP gRPC to :4317
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+  filelog:                       # Collect structured JSON logs from pod stdout
+    include: [/var/log/pods/pulse_*/*/*.log]
+    operators:
+      - type: json_parser        # Parse JSON log lines
+      - type: regex_parser       # Extract k8s metadata from file path
+        regex: '^.*/(?P<namespace>[^_]+)_(?P<pod_name>[^_]+)_...'
+  prometheus:                    # Scrape OTel Collector's own metrics
+    config:
+      scrape_configs:
+        - job_name: otel-self
+          static_configs: [{ targets: [localhost:8888] }]
+
+# Processors (applied in order)
+processors:
+  memory_limiter:                # Hard cap at 400 MiB — prevents OOM
+    limit_mib: 400
+    check_interval: 1s
+  k8sattributes:                 # Enrich with pod/namespace/node metadata
+    auth_type: serviceAccount
+    extract:
+      metadata: [k8s.pod.name, k8s.namespace.name, k8s.deployment.name, k8s.node.name]
+      labels:
+        - { tag_name: app, key: app, from: pod }
+  resource:                      # Add environment tags
+    attributes:
+      - { action: insert, key: service.environment, value: minikube }
+  batch:                         # Batch for efficiency
+    timeout: 5s
+    send_batch_size: 512
+  tail_sampling:                 # Keep 100% errors, 100% slow (>200ms), 10% rest
+    decision_wait: 10s
+    policies:
+      - { name: errors, type: status_code, status_code: { status_codes: [ERROR] } }
+      - { name: slow,   type: latency,     latency: { threshold_ms: 200 } }
+      - { name: sample, type: probabilistic, probabilistic: { sampling_percentage: 10 } }
+
+# Exporters
+exporters:
+  otlp/tempo:                    # Traces → Tempo
+    endpoint: tempo.monitoring.svc.cluster.local:4317
+    tls: { insecure: true }
+  prometheusremotewrite:         # Metrics → Mimir
+    endpoint: http://mimir.monitoring.svc.cluster.local:9009/api/v1/push
+    headers: { X-Scope-OrgID: pulse }
+  prometheus:                    # Metrics scrape endpoint (Prometheus pulls :8889)
+    endpoint: 0.0.0.0:8889
+  loki:                          # Logs → Loki
+    endpoint: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+    labels:
+      resource:
+        service.name: service_name
+        k8s.namespace.name: namespace
+        k8s.pod.name: pod
+
+# Pipelines
+service:
+  pipelines:
+    traces:  { receivers: [otlp],              processors: [memory_limiter, k8sattributes, resource, batch, tail_sampling], exporters: [otlp/tempo] }
+    metrics: { receivers: [otlp, prometheus],  processors: [memory_limiter, k8sattributes, resource, batch],               exporters: [prometheusremotewrite, prometheus] }
+    logs:    { receivers: [filelog],           processors: [memory_limiter, k8sattributes, resource, batch],               exporters: [loki] }
+```
+
+### 19.2 Metrics (Prometheus / Mimir)
+
+All services expose `/metrics` on port `9091`. Prometheus scrapes them every 15s and remote_writes to Mimir for long-term storage.
 
 | Metric Name | Type | Labels | Description |
 |-------------|------|--------|-------------|
-| `pulse_events_ingested_total` | Counter | `app_id`, `status` | Events accepted/rejected |
-| `pulse_events_deduplicated_total` | Counter | `app_id`, `stage` | Dedup hits (bloom/redis) |
-| `pulse_gateway_request_duration_seconds` | Histogram | `status_code` | Gateway HTTP latency |
+| `pulse_ingest_events_total` | Counter | `app_id`, `status` | Events accepted/rejected at gateway |
+| `pulse_ingest_errors_total` | Counter | `app_id` | Ingest errors |
+| `pulse_ingest_latency_seconds` | Histogram | `status_code` | Gateway HTTP latency |
+| `pulse_ingest_duplicates_filtered_total` | Counter | `app_id`, `stage` | Dedup hits (bloom/redis) |
+| `pulse_ingest_batch_size` | Histogram | — | Events per batch |
 | `pulse_kafka_publish_duration_seconds` | Histogram | `topic` | Kafka produce latency |
-| `pulse_kafka_consumer_lag` | Gauge | `topic`, `group`, `partition` | Consumer group lag |
+| `pulse_consumer_lag` | Gauge | `topic`, `group`, `partition` | Consumer group lag |
 | `pulse_clickhouse_insert_duration_seconds` | Histogram | `table` | CH insert latency |
-| `pulse_clickhouse_insert_rows_total` | Counter | `table` | Rows inserted |
-| `pulse_query_duration_seconds` | Histogram | `query_type`, `cache_level` | Query API latency |
-| `pulse_cache_hits_total` | Counter | `level` | Cache hit count (l1/l2/l3) |
+| `pulse_clickhouse_inserted_total` | Counter | `table` | Rows inserted to ClickHouse |
+| `pulse_clickhouse_query_latency_seconds` | Histogram | `query_type`, `cache_level` | Query API latency |
+| `pulse_query_requests_total` | Counter | `query_type`, `status` | Query API request count |
+| `pulse_redis_cache_hits_total` | Counter | `level` | Cache hits (l1/l2) |
+| `pulse_redis_cache_misses_total` | Counter | `level` | Cache misses |
 | `pulse_redis_operation_duration_seconds` | Histogram | `operation` | Redis latency |
+| `pulse_sessions_opened_total` | Counter | `app_id` | New sessions started |
+| `pulse_session_duration_seconds` | Histogram | `app_id` | Session duration distribution |
 | `pulse_alert_fired_total` | Counter | `app_id`, `rule_id` | Alert fires |
 | `pulse_circuit_breaker_state` | Gauge | `service`, `target` | 0=closed, 1=open |
 
-### 19.2 Distributed Tracing (OpenTelemetry)
+**Prometheus alert rules** (defined in `deployments/k8s/monitoring/prometheus-rules.yaml`):
+- `HighIngestErrorRate`: error rate > 1% for 2 min → warning
+- `HighIngestLatency`: P95 > 200ms for 5 min → warning
+- `KafkaConsumerLagHigh`: lag > 1M messages for 5 min → critical
+- `ClickHouseInsertLatencyHigh`: P95 insert > 5s for 5 min → warning
 
-```
-Trace spans created:
-  Gateway:
-    → "gateway.handle_request"        (root span)
-    → "auth.validate_api_key"
-    → "ratelimit.check"
-    → "dedup.bloom_check"
-    → "dedup.redis_check"
-    → "geoip.lookup"
-    → "kafka.publish" (raw-events)
-    → "mongo.archive"
+### 19.3 Distributed Tracing (Tempo)
 
-  Enricher:
-    → "enricher.process_event"
-    → "ua.parse"
-    → "session.assign"
-    → "kafka.publish" (enriched-events)
-
-  Query API:
-    → "queryapi.handle_request"
-    → "cache.l1_lookup"
-    → "cache.l2_lookup" (Redis)
-    → "clickhouse.query"
-    → "cache.l2_store"
-
-Propagation: W3C TraceContext headers (traceparent, tracestate)
-Sampling: 10% (configurable), 100% for errors
-Exporter: OTLP gRPC to OpenTelemetry Collector → Jaeger
-```
-
-### 19.3 Structured Logging (Uber Zap)
+All services initialise the OTel SDK in `main()` via `tracing.Init()`:
 
 ```go
-// Example log line (JSON)
-{
-  "level": "info",
-  "ts": "2026-04-11T10:00:00.042Z",
-  "caller": "gateway/handler.go:142",
-  "msg": "batch ingested",
-  "service": "gateway",
-  "request_id": "req_7f3a...",
-  "app_id": "app_abc123",
-  "accepted": 48,
-  "rejected": 2,
-  "duplicates": 1,
-  "latency_ms": 23.4,
-  "trace_id": "abc123..."
+// internal/tracing/otel.go
+func Init(ctx context.Context, cfg *config.TelemetryConfig, log *zap.Logger) (*sdktrace.TracerProvider, error) {
+    exporter, err := otlptracegrpc.New(ctx,
+        otlptracegrpc.WithEndpoint(cfg.Endpoint),   // otel-collector:4317
+        otlptracegrpc.WithInsecure(),
+    )
+    sampler := sdktrace.ParentBased(
+        sdktrace.TraceIDRatioBased(cfg.SampleRate),  // 1.0 in dev, 0.01 in prod
+    )
+    tp := sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(exporter),
+        sdktrace.WithSampler(sampler),
+        sdktrace.WithResource(resource.NewWithAttributes(
+            semconv.SchemaURL,
+            semconv.ServiceNameKey.String(cfg.ServiceName),
+            attribute.String("deployment.environment", cfg.Environment),
+        )),
+    )
+    otel.SetTracerProvider(tp)
+    otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+        propagation.TraceContext{},
+        propagation.Baggage{},
+    ))
+    return tp, nil
 }
 ```
 
-### 19.4 Health Check Endpoints
+**Spans created per service:**
 
 ```
-GET /health  → 200 OK {"status":"ok"}  (liveness: always 200 if process is alive)
+Gateway:
+  gateway.handle_request          (root span, HTTP method + path)
+  ├── auth.validate_api_key
+  ├── ratelimit.check
+  ├── dedup.bloom_check
+  ├── dedup.redis_check
+  ├── geoip.lookup
+  ├── kafka.publish                (raw-events)
+  └── mongo.archive                (async)
+
+Enricher:
+  enricher.process_event
+  ├── ua.parse
+  ├── geoip.lookup
+  ├── session.assign               (Redis HGETALL + HMSET)
+  └── kafka.publish                (enriched-events)
+
+Query API:
+  queryapi.handle_request
+  ├── cache.l1_lookup
+  ├── cache.l2_lookup              (Redis GET)
+  ├── clickhouse.query             (with query_type attribute)
+  └── cache.l2_store               (Redis SETEX)
+```
+
+**Trace-to-log correlation:** Every log line includes `trace_id` and `span_id` fields (injected by the OTel SDK). Grafana Loki datasource is configured with a derived field that extracts `trace_id` and links to Tempo.
+
+**Trace-to-metric correlation:** Tempo's metrics generator produces `traces_spanmetrics_*` and `traces_service_graph_*` metrics, remote-written to Mimir. These power the service map and RED metrics in Grafana.
+
+### 19.4 Log Collection (Loki)
+
+Logs flow: pod stdout (JSON) → filelog receiver in OTel Collector → Loki exporter → Loki.
+
+**Log format** (all services use `go.uber.org/zap` in JSON mode):
+```json
+{
+  "level":      "info",
+  "ts":         "2026-05-01T10:00:00.042Z",
+  "caller":     "gateway/handler.go:142",
+  "msg":        "batch ingested",
+  "service":    "gateway",
+  "request_id": "req_7f3a...",
+  "app_id":     "app_abc123",
+  "accepted":   48,
+  "rejected":   2,
+  "latency_ms": 23.4,
+  "trace_id":   "abc123def456...",
+  "span_id":    "7890abcd..."
+}
+```
+
+**Loki label scheme:**
+```
+{namespace="pulse", pod="gateway-xxx", container="gateway", service_name="gateway"}
+```
+
+**LogQL query examples:**
+```logql
+# All gateway errors in last 5 min
+{namespace="pulse", container="gateway"} | json | level="error"
+
+# Slow requests (>200ms)
+{namespace="pulse", container="gateway"} | json | latency_ms > 200
+
+# Trace correlation: find logs for a specific trace
+{namespace="pulse"} | json | trace_id="abc123def456"
+```
+
+### 19.5 Grafana Datasource Configuration
+
+```yaml
+# Auto-provisioned via ConfigMap grafana-datasources
+datasources:
+  - name: Mimir          # Primary metrics (default)
+    type: prometheus
+    url: http://mimir.monitoring.svc.cluster.local:9009/prometheus
+    headers: { X-Scope-OrgID: pulse }
+
+  - name: Prometheus     # Direct scrape fallback
+    type: prometheus
+    url: http://prometheus.monitoring.svc.cluster.local:9090
+
+  - name: Loki           # Logs
+    type: loki
+    url: http://loki.monitoring.svc.cluster.local:3100
+    derivedFields:
+      - matcherRegex: '"trace_id":"(\w+)"'
+        name: TraceID
+        url: "${__value.raw}"
+        datasourceUid: tempo
+
+  - name: Tempo          # Traces
+    type: tempo
+    url: http://tempo.monitoring.svc.cluster.local:3200
+    tracesToLogsV2:
+      datasourceUid: loki
+      query: '{namespace="${__span.tags.namespace}", pod="${__span.tags.pod}"} |= "${__trace.traceId}"'
+    tracesToMetrics:
+      datasourceUid: mimir
+    serviceMap:
+      datasourceUid: mimir
+    nodeGraph:
+      enabled: true
+```
+
+### 19.6 Health Check Endpoints
+
+```
+GET /health  → 200 OK {"status":"ok"}
 GET /ready   → 200 OK {"status":"ready", "checks": {...}}
             OR 503    {"status":"not_ready", "checks": {"kafka": "disconnected"}}
 
-Ready checks per service:
-  Gateway:    Kafka producer connected, Redis ping OK, PostgreSQL ping OK
-  Enricher:   Kafka consumer connected, Redis ping OK
-  CH-Writer:  Kafka consumer connected, ClickHouse ping OK
-  Query API:  ClickHouse ping OK, Redis ping OK, PostgreSQL ping OK
+OTel Collector health:
+  GET http://otel-collector:13133/  → 200 OK (health_check extension)
+  GET http://otel-collector:55679/  → zpages debug UI
+
+Grafana health:
+  GET http://grafana:3000/api/health → {"commit":"...","database":"ok","version":"11.1.0"}
 ```
 
 ---
@@ -1989,4 +2167,265 @@ redis:
 
 ---
 
-*Document version: 1.1 | Architecture owner: Platform Engineering | Last updated: 2026-04-17*
+*Document version: 1.2 | Architecture owner: Platform Engineering | Last updated: 2026-05-01*
+
+---
+
+## 22. Minikube Deployment — Detailed Design
+
+### 22.1 File Structure
+
+```
+deployments/minikube/
+├── namespace.yaml          # pulse + monitoring namespaces
+├── secrets.yaml            # dev-safe plaintext secrets for all services
+├── configmap.yaml          # all 9 service configs (in-cluster DNS names)
+├── ingress.yaml            # nginx ingress: pulse.local, api.pulse.local, grafana.pulse.local
+├── deploy.sh               # one-shot bash deploy script
+│
+├── infra/
+│   ├── kafka.yaml          # Strimzi single-broker + 6 KafkaTopic resources
+│   ├── redis.yaml          # Redis 7.2 standalone + redis_exporter sidecar
+│   ├── clickhouse.yaml     # ClickHouse 24.3 + Prometheus metrics endpoint
+│   ├── postgres.yaml       # Postgres 16 single pod
+│   └── mongo.yaml          # MongoDB 7.0 single pod
+│
+├── monitoring/
+│   ├── otel-collector.yaml # OTel Collector with full LGTM pipeline + RBAC
+│   ├── loki.yaml           # Grafana Loki 3.1 (single-binary, filesystem)
+│   ├── tempo.yaml          # Grafana Tempo 2.5 (single-binary, emptyDir)
+│   ├── mimir.yaml          # Grafana Mimir 2.13 (single-binary, emptyDir)
+│   ├── prometheus.yaml     # Prometheus 2.53 (scrapes all services, remote_write to Mimir)
+│   ├── grafana.yaml        # Grafana 11.1 (all 4 datasources pre-wired)
+│   └── grafana-dashboards.yaml  # 6 pre-built dashboards as ConfigMap
+│
+├── services/
+│   ├── gateway.yaml        # 1 replica, imagePullPolicy: Never, NodePort
+│   ├── enricher.yaml       # 1 replica, imagePullPolicy: Never
+│   ├── session.yaml        # 1 replica
+│   ├── funnel.yaml         # 1 replica
+│   ├── chwriter.yaml       # 1 replica
+│   ├── query-api.yaml      # 1 replica, NodePort
+│   ├── alertengine.yaml    # 1 replica
+│   ├── auth-service.yaml   # 1 replica, NodePort
+│   └── notification-service.yaml  # 1 replica
+│
+└── loadtest/
+    └── locust.yaml         # Locust master (1 pod) + workers (2 pods), NodePort UI
+```
+
+### 22.2 Image Build Strategy
+
+Images are built directly into Minikube's Docker daemon using `eval $(minikube docker-env)`. This avoids the need for a container registry:
+
+```bash
+eval $(minikube docker-env -p minikube)
+docker build -t pulse-gateway:dev -f deployments/docker/gateway.Dockerfile .
+```
+
+All service deployments use `imagePullPolicy: Never` so Kubernetes uses the locally built image without attempting a registry pull.
+
+### 22.3 Service Discovery
+
+All services communicate via Kubernetes ClusterIP DNS:
+
+| Service | DNS Name | Port |
+|---------|----------|------|
+| Kafka bootstrap | `pulse-kafka-kafka-bootstrap.pulse.svc.cluster.local` | 9092 |
+| Redis | `redis-master.pulse.svc.cluster.local` | 6379 |
+| ClickHouse | `clickhouse.pulse.svc.cluster.local` | 9000 |
+| Postgres | `postgres.pulse.svc.cluster.local` | 5432 |
+| MongoDB | `mongo.pulse.svc.cluster.local` | 27017 |
+| OTel Collector | `otel-collector.monitoring.svc.cluster.local` | 4317 |
+| Loki | `loki.monitoring.svc.cluster.local` | 3100 |
+| Tempo | `tempo.monitoring.svc.cluster.local` | 3200 |
+| Mimir | `mimir.monitoring.svc.cluster.local` | 9009 |
+| Grafana | `grafana.monitoring.svc.cluster.local` | 3000 |
+
+### 22.4 ConfigMap Design
+
+A single `pulse-configs` ConfigMap in the `pulse` namespace contains YAML config files for all 9 services. Each service mounts it at `/app/configs` and reads its own file via `CONFIG_PATH` env var:
+
+```yaml
+# In each service deployment:
+env:
+  - name: CONFIG_PATH
+    value: /app/configs/gateway.yaml   # or enricher.yaml, queryapi.yaml, etc.
+volumeMounts:
+  - name: configs
+    mountPath: /app/configs
+    readOnly: true
+volumes:
+  - name: configs
+    configMap:
+      name: pulse-configs
+```
+
+All configs point to in-cluster DNS names and use `telemetry.endpoint: otel-collector.monitoring.svc.cluster.local:4317` with `insecure: true`.
+
+### 22.5 Kafka Setup (Strimzi)
+
+Strimzi Operator is installed cluster-wide before deploying the Kafka resource:
+
+```bash
+kubectl apply -f "https://strimzi.io/install/latest?namespace=pulse"
+```
+
+The Minikube Kafka config uses:
+- 1 broker (vs 3 in production)
+- `replication.factor: 1` and `min.insync.replicas: 1` (vs 3/2 in production)
+- `storage.type: ephemeral` (vs persistent-claim in production)
+- Reduced resource limits (512Mi RAM vs 8Gi in production)
+
+KafkaTopic resources are applied alongside the Kafka cluster and managed by Strimzi's Entity Operator.
+
+### 22.6 Observability Stack Startup Order
+
+The LGTM stack must start in this order to avoid connection errors:
+
+```
+1. Loki    (Tempo and OTel Collector depend on it)
+2. Tempo   (OTel Collector depends on it)
+3. Mimir   (Prometheus and OTel Collector depend on it)
+4. OTel Collector  (services depend on it for trace export)
+5. Prometheus      (depends on Mimir for remote_write)
+6. Grafana         (depends on all datasources)
+```
+
+The `deploy.sh` script applies them in this order and waits for each rollout before proceeding.
+
+### 22.7 Ingress Configuration
+
+Requires the Minikube nginx ingress addon:
+
+```bash
+minikube addons enable ingress
+```
+
+Add to `/etc/hosts`:
+```
+$(minikube ip)  pulse.local api.pulse.local grafana.pulse.local
+```
+
+| Host | Backend Service | Port |
+|------|----------------|------|
+| `pulse.local` | `gateway` | 8080 |
+| `api.pulse.local` | `query-api` | 8082 |
+| `grafana.pulse.local` | `grafana` | 3000 |
+
+---
+
+## 23. Load Testing — Detailed Design
+
+### 23.1 Architecture
+
+Locust runs in distributed mode inside the `loadtest` namespace:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Namespace: loadtest                                             │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  locust-master (1 pod)                                   │   │
+│  │  • Coordinates workers                                   │   │
+│  │  • Serves web UI on :8089 (NodePort)                     │   │
+│  │  • Aggregates stats from workers                         │   │
+│  │  • Exposes Prometheus metrics on :9646                   │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                          │ :5557/:5558                           │
+│         ┌────────────────┴────────────────┐                     │
+│         ▼                                 ▼                     │
+│  ┌─────────────┐                  ┌─────────────┐               │
+│  │locust-worker│                  │locust-worker│               │
+│  │  (pod 1)    │                  │  (pod 2)    │               │
+│  └──────┬──────┘                  └──────┬──────┘               │
+│         │                                │                       │
+│         └──────────────┬─────────────────┘                      │
+│                        │ HTTP requests                           │
+│                        ▼                                         │
+│         gateway.pulse.svc.cluster.local:8080                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 23.2 Locustfile Design (`loadtest/locustfile.py`)
+
+The locustfile defines two `HttpUser` subclasses:
+
+**`SDKUser`** (weight=80, wait_time=0.1–1.0s):
+- Simulates mobile/web SDK clients sending event batches
+- `on_start()`: picks a random `app_id` from pool of 5, sets `X-API-Key` header
+- Task distribution: 70% small (1–10 events), 20% medium (25–100), 5% large (200–500), 5% health
+
+**`DashboardUser`** (weight=20, wait_time=1.0–5.0s):
+- Simulates analysts running analytics queries
+- `on_start()`: picks a random `app_id`, sets `Authorization: Bearer dev-token`
+- Task distribution: 40% event count, 30% active users, 20% retention, 10% health
+
+**Shared test data:**
+```python
+APP_IDS  = ["app_0001", "app_0002", "app_0003", "app_0004", "app_0005"]
+USER_IDS = [str(uuid.uuid4()) for _ in range(500)]  # pool of 500 user IDs
+```
+
+**Event generation** (`make_event()`):
+- Generates realistic event payloads with random `event_type`, `platform`, `country`, `page`, `referrer`, `value`
+- Each event gets a unique `event_id` (UUID) and current timestamp
+
+### 23.3 Prometheus Metrics from Locust
+
+Locust exposes metrics on `:9646/metrics` (scraped by Prometheus):
+
+| Metric | Description |
+|--------|-------------|
+| `locust_requests_current_rps` | Current requests per second per endpoint |
+| `locust_requests_current_fail_per_sec` | Current failures per second |
+| `locust_requests_avg_response_time` | Average response time in ms |
+| `locust_requests_num_failures` | Total failure count |
+| `locust_users` | Current number of active users |
+
+These are displayed in the **Load Test** Grafana dashboard alongside gateway metrics, enabling direct correlation between load parameters and system behaviour.
+
+### 23.4 Test Execution
+
+**Via Locust web UI (in-cluster):**
+```bash
+make minikube-locust
+# Opens browser to Locust UI
+# Set: Number of users = 50, Spawn rate = 5/s, Host = (pre-filled)
+# Click "Start swarming"
+```
+
+**Headless (local):**
+```bash
+make loadtest-headless
+# Runs: locust --headless --users=50 --spawn-rate=5 --run-time=5m
+# Saves HTML report to loadtest/report.html
+```
+
+**Recommended progression:**
+```
+1. Smoke:    5 users,  1/s,  2 min  → verify all endpoints respond
+2. Baseline: 20 users, 2/s,  5 min  → establish baseline metrics
+3. Load:     50 users, 5/s,  10 min → normal expected load
+4. Stress:   100 users,10/s, 10 min → find breaking point
+5. Soak:     30 users, 3/s,  30 min → detect memory leaks / drift
+```
+
+### 23.5 Interpreting Results
+
+During a load test, watch these Grafana panels:
+
+| Panel | What to look for |
+|-------|-----------------|
+| Gateway Events/sec | Should scale linearly with Locust RPS |
+| P95 Ingest Latency | Should stay < 50ms under normal load |
+| Kafka Consumer Lag | Should stay near 0 (enricher keeping up) |
+| Pod CPU (pulse ns) | Should not hit limits (would cause throttling) |
+| Locust Failures/sec | Should be 0 unless rate limiting kicks in |
+| Redis Memory | Should grow slowly (session state) then plateau |
+
+A spike in Kafka consumer lag with stable gateway throughput indicates the enricher is the bottleneck — scale up enricher replicas.
+
+---
+
+*Document version: 1.2 | Architecture owner: Platform Engineering | Last updated: 2026-05-01*

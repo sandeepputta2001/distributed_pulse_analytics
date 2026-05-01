@@ -1,0 +1,353 @@
+---
+# ─── OpenTelemetry Collector ConfigMap ───────────────────────────────────────
+# Full LGTM pipeline:
+#   Traces  → Tempo
+#   Metrics → Mimir (via remote_write) + Prometheus scrape on :8889
+#   Logs    → Loki
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: monitoring
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+      # Scrape Prometheus metrics from pulse services
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: otel-collector-self
+              scrape_interval: 15s
+              static_configs:
+                - targets: [localhost:8888]
+
+      # Collect k8s container logs via filelog
+      filelog:
+        include:
+          - /var/log/pods/pulse_*/*/*.log
+        start_at: beginning
+        include_file_path: true
+        include_file_name: false
+        operators:
+          - type: router
+            id: get-format
+            routes:
+              - output: parser-docker
+                expr: 'body matches "^\\{"'
+              - output: move-message
+                expr: 'true'
+          - type: json_parser
+            id: parser-docker
+            output: extract-metadata-from-filepath
+          - type: move
+            id: move-message
+            from: body
+            to: attributes.message
+            output: extract-metadata-from-filepath
+          - type: regex_parser
+            id: extract-metadata-from-filepath
+            regex: '^.*\/(?P<namespace>[^_]+)_(?P<pod_name>[^_]+)_(?P<uid>[a-f0-9\-]+)\/(?P<container_name>[^\._]+)\/(?P<restart_count>\d+)\.log$'
+            parse_from: attributes["log.file.path"]
+            cache:
+              size: 128
+          - type: move
+            from: attributes.namespace
+            to: resource["k8s.namespace.name"]
+          - type: move
+            from: attributes.pod_name
+            to: resource["k8s.pod.name"]
+          - type: move
+            from: attributes.container_name
+            to: resource["k8s.container.name"]
+
+    processors:
+      batch:
+        timeout: 5s
+        send_batch_size: 512
+
+      memory_limiter:
+        limit_mib: 400
+        check_interval: 1s
+
+      # Add k8s metadata to all telemetry
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        filter:
+          node_from_env_var: KUBE_NODE_NAME
+        extract:
+          metadata:
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.deployment.name
+            - k8s.namespace.name
+            - k8s.node.name
+            - k8s.pod.start_time
+          labels:
+            - tag_name: app
+              key: app
+              from: pod
+            - tag_name: component
+              key: component
+              from: pod
+        pod_association:
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.ip
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.uid
+          - sources:
+              - from: connection
+
+      # Enrich resource attributes
+      resource:
+        attributes:
+          - action: insert
+            key: service.environment
+            value: minikube
+          - action: insert
+            key: deployment.environment
+            value: development
+
+      # Tail-based sampling: keep 100% errors, 10% slow (>200ms), 5% rest
+      tail_sampling:
+        decision_wait: 10s
+        num_traces: 50000
+        expected_new_traces_per_sec: 100
+        policies:
+          - name: errors-policy
+            type: status_code
+            status_code: {status_codes: [ERROR]}
+          - name: slow-traces-policy
+            type: latency
+            latency: {threshold_ms: 200}
+          - name: probabilistic-policy
+            type: probabilistic
+            probabilistic: {sampling_percentage: 10}
+
+    exporters:
+      # Traces → Tempo
+      otlp/tempo:
+        endpoint: tempo.monitoring.svc.cluster.local:4317
+        tls:
+          insecure: true
+
+      # Metrics → Mimir remote_write
+      prometheusremotewrite:
+        endpoint: http://mimir.monitoring.svc.cluster.local:9009/api/v1/push
+        tls:
+          insecure_skip_verify: true
+        headers:
+          X-Scope-OrgID: pulse
+
+      # Metrics scrape endpoint (Prometheus pulls from here)
+      prometheus:
+        endpoint: "0.0.0.0:8889"
+        namespace: pulse
+        resource_to_telemetry_conversion:
+          enabled: true
+
+      # Logs → Loki
+      loki:
+        endpoint: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+        tls:
+          insecure: true
+        default_labels_enabled:
+          exporter: false
+          job: true
+        labels:
+          resource:
+            service.name: "service_name"
+            k8s.namespace.name: "namespace"
+            k8s.pod.name: "pod"
+            k8s.container.name: "container"
+
+      debug:
+        verbosity: basic
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      pprof:
+        endpoint: 0.0.0.0:1777
+      zpages:
+        endpoint: 0.0.0.0:55679
+
+    service:
+      extensions: [health_check, pprof, zpages]
+      pipelines:
+        traces:
+          receivers:  [otlp]
+          processors: [memory_limiter, k8sattributes, resource, batch, tail_sampling]
+          exporters:  [otlp/tempo]
+
+        metrics:
+          receivers:  [otlp, prometheus]
+          processors: [memory_limiter, k8sattributes, resource, batch]
+          exporters:  [prometheusremotewrite, prometheus]
+
+        logs:
+          receivers:  [filelog]
+          processors: [memory_limiter, k8sattributes, resource, batch]
+          exporters:  [loki]
+
+      telemetry:
+        logs:
+          level: warn
+        metrics:
+          address: 0.0.0.0:8888
+
+---
+# ─── OTel Collector RBAC ─────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: monitoring
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/proxy, nodes/metrics, services, endpoints, pods]
+    verbs: [get, list, watch]
+  - apiGroups: [extensions, networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch]
+  - nonResourceURLs: [/metrics, /metrics/cadvisor]
+    verbs: [get]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: monitoring
+
+---
+# ─── OTel Collector Deployment ───────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: monitoring
+  labels:
+    app: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8889"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.102.0
+          args: ["--config=/etc/otel/config.yaml"]
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: prom-metrics
+              containerPort: 8889
+            - name: self-metrics
+              containerPort: 8888
+            - name: health
+              containerPort: 13133
+            - name: zpages
+              containerPort: 55679
+          volumeMounts:
+            - name: otel-config
+              mountPath: /etc/otel
+              readOnly: true
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: otel-config
+          configMap:
+            name: otel-collector-config
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: monitoring
+  labels:
+    app: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: prom-metrics
+      port: 8889
+      targetPort: 8889
+    - name: health
+      port: 13133
+      targetPort: 13133
+    - name: zpages
+      port: 55679
+      targetPort: 55679
+  type: ClusterIP

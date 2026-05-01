@@ -1,0 +1,85 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chwriter
+  namespace: pulse
+  labels:
+    app: chwriter
+    component: storage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chwriter
+  template:
+    metadata:
+      labels:
+        app: chwriter
+        component: storage
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: chwriter
+          image: pulse-chwriter:dev
+          imagePullPolicy: Never
+          ports:
+            - name: metrics
+              containerPort: 9091
+          env:
+            - name: CONFIG_PATH
+              value: /app/configs/chwriter.yaml
+            - name: PULSE_SERVICE_ENVIRONMENT
+              value: development
+            - name: PULSE_KAFKA_BROKERS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-kafka-secret
+                  key: brokers
+            - name: PULSE_CLICKHOUSE_HOSTS
+              valueFrom:
+                secretKeyRef:
+                  name: pulse-clickhouse-secret
+                  key: hosts
+            - name: PULSE_OTEL_ENDPOINT
+              value: "otel-collector.monitoring.svc.cluster.local:4317"
+          volumeMounts:
+            - name: configs
+              mountPath: /app/configs
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "kill -0 1"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: configs
+          configMap:
+            name: pulse-configs
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chwriter
+  namespace: pulse
+  labels:
+    app: chwriter
+spec:
+  selector:
+    app: chwriter
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: 9091
+  type: ClusterIP
